@@ -1057,3 +1057,17 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Cause:** an NRR with 1 in the byte at +5 (the Switch 2's) has a header 0x180 bytes longer. The same fields follow it: program ID +0x4b0, size +0x4b8, hash table +0x4c0, its count +0x4c4.
 - **Fix:** `hle_ro.c` and `nro_collect.py` read the table by that byte.
 - **Found on:** [Mario Tennis Fever](../../dm/games/0400D4201C6EA000/README.md).
+
+### nn::socket::EventFd, the guest's wakeup descriptors
+
+- **Symptom:** a Switch 2 game's thread aborts in NPLN's grpc init, or its own check fails, over an eventfd: Ocarina of Time's "none" poll-strategy creator aborts at grpc's `wakeup_fd_eventfd.cc:41` (an nn::diag abort with empty message parts), and Star Fox's HTTP thread polls a wake-up descriptor the host never made.
+- **Cause:** SDK 22's socket service gained an eventfd API for NPLN — `nn::socket::EventFd(unsigned, EventFdFlags)`, `EventFdWrite(int, int)`, `EventFdRead(int, void*, unsigned long)` — and grpc builds its thread wakeups on it. The offline socket layer had only failing stubs, and macOS has no eventfd to bind the imports to.
+- **Fix:** `hle_net.c` backs each guest descriptor with a real host pipe: `EventFd` creates it non-blocking (a nonzero initial value is written at once), `EventFdWrite` writes the 8-byte counter to the write end, `EventFdRead` drains the read end (EAGAIN maps to its Horizon errno), and `dm_sk_poll` polls the read ends of the descriptors in the eventfd range for real instead of idling out the timeout. The descriptors the host makes start at 0x40000000; nothing else in the offline socket layer makes descriptors.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (its grpc requires the API) and [Star Fox](../../dm/games/0400E88025B1A000/README.md) (its HTTP thread's poll tolerates the failure, but now gets a real descriptor).
+
+### prepo's PlayReport::Send offline: the AsyncContext cut
+
+- **Symptom:** after a telemetry submission the game aborts with the failed service connection's result (Ocarina of Time: `Result 0xe15` at sdk+0x5ab400, the prepo:u connect), or later in `AsyncContext::GetCompletionEvent` with an NPLN error (`Result 0xc6cb9040` at sdk+0x5a92d0, the vtable path's error on a real but failed context).
+- **Cause:** SDK 22's `PlayReport::Send(const account::Uid&)` returns its `AsyncContext` by value — the caller's sret pointer arrives in x8 — and the game waits on the context's completion event. A host hook returning only a `Result` leaves the caller's context garbage; the real Send needs the prepo service, which the offline host does not serve.
+- **Fix:** the sdk build's cut (dm/tools/sdk_patches.py) makes `prepo::detail::PlayReportImpl::Send` return an all-zero context — "nothing pending", which `GetCompletionEvent` takes as already complete (its null-impl branch) — and drop the report. `hle_offline.c` then hooks `GetCompletionEvent` to run the original (which creates the system event into the caller's storage) and signal it at once: a never-signalled event blocks the waiter, and the game's reused event storage trips `CreateSystemEvent`'s stale-state check on the next report.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (both the movie thread's report and the save-porter's).

@@ -107,6 +107,13 @@
 - **Fix:** `main.m` (`romfs_document_images`) lists Documents for `romfs.img` in any letter case, `romfs.img` itself first, and takes the first that is complete and passes the `romfs.id` check; a rejected or incomplete one falls through to the next spelling, then to the folders. The identity report, the backup exclusion and the log lines use the names found. Folder names (`Documents/romfs`) are still matched exactly.
 - **Found on:** South Park: The Fractured But Whole 1.05 (`01008F2005154000`, no profile here) on an iPhone 15 Pro Max, [issue #582](https://github.com/seedds/nxnative/issues/582). The Foundation startup test runs the locator on a case-sensitive APFS disk image.
 
+### The overlay serves every read-only content mount
+
+- **Symptom:** a game's file that `DM_ROMFS_OVERLAY` holds is not found, though the same overlay serves other files of the same RomFS. Ocarina of Time opened `_npln:/npln_config.json` (which its update-only RomFS lacks) and got "not found" while the overlay was set.
+- **Cause:** `mount_ex` took the overlay only for the mount named `rom`. A game can mount its content under several names — Ocarina of Time mounts its RomFS as `content` and again as `_npln` — and the files only one of them expects are then missing on every other.
+- **Fix:** `mount_ex` takes `DM_ROMFS_OVERLAY` for every read-only, non-transactional mount (saves never take one). A mount whose dir is a folder keeps its folder-fallback lookup under the overlay, as before.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
 ### Building creates a full RomFS tree before packing its image
 
 - **Symptom:** reducing the iPhone transfer to one image still creates thousands of resource files on the Mac, and build scanners require the expanded folder.

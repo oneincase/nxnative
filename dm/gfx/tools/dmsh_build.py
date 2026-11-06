@@ -50,6 +50,20 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
 
+# A raw global store marks its guest page in the write log (dmsh_abi.h, Ryujinx GlobalToStorage) through a compare-and-swap retry loop the translator emits as
+# straight-line SPIR-V: `do { v = 0u; } while (!atomic_compare_exchange_weak_explicit(&slot, &v, page, …) && v == 0u);`. Once the log's 1024 slots are taken, every
+# store walks the probe chain and fails, and what it pays for is the CAS: Ocarina of Time's movie composite spent 10.6 ms of a 50 ms frame in it, and the frame went
+# from 53 ms to 43 with this fast path on one program and to 24.8 with it on all 16 that carry one. A plain load first is exactly equivalent — the CAS could only
+# have failed on a value the load already reads — and turns a read-modify-write into a read on the path every store takes.
+_GMEM_LOG_CAS = re.compile(r'(?P<ind>[ \t]*)(?P<ty>uint|int) (?P<v>_\d+);\n[ \t]*do\n[ \t]*\{\n[ \t]*(?P=v) = 0u;\n[ \t]*\} while \(!atomic_compare_exchange_weak_explicit\('
+                           r'(?P<addr>.*?), &(?P=v), (?P<val>.*?)\) && (?P=v) == 0u\);', re.S)
+def gmem_log_fast(msl):
+    def rep(m):
+        i, v, a, val = m.group('ind'), m.group('v'), m.group('addr'), m.group('val')
+        return (f'{i}uint {v} = atomic_load_explicit({a}, memory_order_relaxed);\n'
+                f'{i}if ({v} == 0u) {{ do {{ {v} = 0u; }} while (!atomic_compare_exchange_weak_explicit({a}, &{v}, {val}) && {v} == 0u); }}')
+    return _GMEM_LOG_CAS.sub(rep, msl)
+
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks) reaches the MSL as a call of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1, out D1) → D0, with
 # the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma, TensorPass, HelperFunctionManager.GenerateHmma16816F16). The
 # translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block: A row-major (halves 0..255, 16 a row), B transposed
@@ -1381,7 +1395,9 @@ def finish(key, w, j, c1):
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
-    src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
+    src = border_emu(src)   # border colours Metal lacks (see border_emu)
+    src = gmem_log_fast(src)   # the write log's compare-and-swap chain, a load first (see gmem_log_fast)
+    open(msl, 'w').write(src)
     first, spill = [], 0
     mesh = j.get('mesh_stage')
     if mesh:   # the kernel as the Metal object or mesh function (dmsh_meshstage.py)

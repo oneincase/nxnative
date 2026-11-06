@@ -13,6 +13,21 @@ HLE_FORCE("_ZN2nn5prepo10InitializeEv", "telemetry init: the original connects t
 HLE_FORCE("_ZN2nn5prepo12AddSessionIdEPNS0_10PlayReportEPKc", "telemetry session ID: no service connection, nothing added, reports success", Result, h_prepo_AddSess, void *rep, const char *key) { (void)rep; (void)key; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_", "telemetry internet connection status: no service connection, nothing added, reports success", Result, h_prepo_AddNet, void *rep, const char *a, const char *b, const char *c) { (void)rep; (void)a; (void)b; (void)c; return RES_OK; }
 HLE_FORCE("_ZN2nn5prepo28RequestImmediateTransmissionEv", "telemetry immediate upload; nothing is sent, reports success", Result, h_prepo_Tx, void) { return RES_OK; }
+// The submission itself goes through the sdk build's PlayReportImpl::Send cut (dm/tools/sdk_patches.py): a zeroed
+// AsyncContext, "nothing pending". What the host adds here is the completion event that context promises: the
+// game waits on it after every Send (Ocarina of Time's movie and save-porter threads, main+0x3791660), so
+// GetCompletionEvent's null-impl branch creates the event, and the host signals it at once — a never-signalled
+// event would block the waiter and leave the game's reused event storage in a state the next create refuses
+// ("Result 0xc6cb9040", the stale-handle check at sdk+0x5a92d0).
+HLE_FORCE("_ZN2nn5prepo12AsyncContext18GetCompletionEventEPNS0_2os11SystemEventE", "the dropped report's completion event: created and signalled at once", Result, h_prepo_GetCE, void *ctx, void *out) {
+    static Result (*orig)(void *, void *); static void (*signal)(void *);
+    if (!orig) { orig = guest_sym("_ZN2nn5prepo12AsyncContext18GetCompletionEventEPNS0_2os11SystemEventE");
+                 signal = guest_sym("_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE"); }
+    memset(out, 0, 0x40);
+    Result r = orig(ctx, out);
+    if (!r) signal(out);
+    return r;
+}
 
 // ---------- ldn: local wireless. Initialization fails, state is always "none" ----------
 HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { return RES_FAIL; }

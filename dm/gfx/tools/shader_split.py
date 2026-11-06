@@ -228,6 +228,51 @@ def ndsr_shaders(d, label):
         elif st == 'ps' and prog: BAHS_VAR[prog] = BAHS_VAR[where] = f'{label}#NDSR#{prog.rsplit("@", 1)[1]}'; prog = None
     return out
 
+def ndve_shaders(d, label):
+    """Nintendo's movie engine (Ocarina of Time: Movie/Ndve/Ndve-Nvn2-<stream>.dat.zs), which composites its
+    pictures in compute: one program per block — an NVN2 control section whose +0x30 word (the section's own
+    length in a BNSH file) is here the byte size from the control section to the code area, which is its +0x44
+    length and opens with a 16-byte code header (a u32 program id whose low half is 0x7919, or 0x7202 in the
+    two smallest programs). Two control sections have +0x30 == 0: their code areas are free-standing blocks
+    elsewhere in the file (one before the control sections), recognized by that header and matched to the
+    control section of their length when exactly one free block of it exists. The rule reproduces every program
+    the game loaded of vid_seq5 byte-identically."""
+    def blocks():
+        for m in re.finditer(CTL_MAGIC, d):
+            c = m.start()
+            if not nvn2_ctl(d[c:c + NVN2_KEY_CTL]): continue
+            step = struct.unpack_from('<I', d, c + 0x30)[0]
+            cl = struct.unpack_from('<I', d, c + 0x44)[0]
+            yield c, step, cl
+    out, taken = [], []
+    for c, step, cl in blocks():
+        if not step or not 0x48 <= step <= 0x100000 or not 0x48 <= cl <= len(d) - c - step: continue
+        k = c + step
+        taken.append((k, k + cl))
+        out.append((c, k, cl))
+    zeros = [(c, cl) for c, step, cl in blocks() if not step and 0x48 <= cl <= len(d)]
+    zeros.sort(key=lambda t: -t[1])   # the longest first: the shorter control section (Ocarina of Time's 0x300 one, a duplicate entry for the same program) then finds its block taken and stays out
+    for c, cl in zeros:
+        cands = []
+        for m in re.finditer(rb'\x19\x79|\x02\x72', d):   # a free code header: the id's low half (0x7919) or the small programs' 0x7202, at offset 0 of the header; its next three words are the same in every program's header
+            i = m.start()
+            if i < 0 or i + cl > len(d) or d[i + 4:i + 16] != bytes.fromhex('000000000021000000220e00'): continue
+            if any(a <= i < b or a < i + cl <= b for a, b in taken): continue
+            cands.append(i)
+        uniq = sorted(set(cands))
+        if len(uniq) != 1: continue   # zero or several free blocks of this length: the pairing is not known, the program stays out (its draw reports a red line)
+        k = uniq[0]
+        taken.append((k, k + cl))
+        out.append((c, k, cl))
+    r = []
+    for c, k, cl in out:
+        code = d[k:k + cl]
+        ctl = d[c:c + 0xd8]   # the BNSH NVN2 section's length: past the compute facts dmsh_build reads (+0x58, +0x64) and its nvn2_cs dispatch words (+0xa9..+0xbb); the key still hashes the first 0x48 with +0x30 as zero
+        st = nvn2_stage(ctl, code)
+        if st is None or check(label, st, ctl, code): continue
+        r.append((f'{label}#NDVE@{c:#x}', st, ctl, code))
+    return r
+
 BAHS_VAR = {}   # BAHS entry label → the program variation it belongs to (bahs_variations; var_pairs pairs by it)
 def bahs_variations(d, label, entries):
     """The variations of an agl BAHS file's programs, for var_pairs. The table area holds a binary array (u32 byte size, u32 count, then per binary a record: u32 record size, u32 kind
@@ -2528,6 +2573,11 @@ def scan_blob(d, label, out, depth=0, left=None):
         for m in re.finditer(b'NDSR', d):
             if m.start() + 0x20 <= len(d) and d[m.start() + 4:m.start() + 6] == b'\x00\x01': out.extend(ndsr_shaders(d[m.start():], f'{label}#NDSR@{m.start():#x}'))
         return
+    if d[:4] == b'NDVE':   # Nintendo's movie engine (Ocarina of Time: Movie/Ndve/Ndve-Nvn2-vid_seq*.dat.zs): the presentation programs, and an NDSR pack of its own beside them
+        out.extend(ndve_shaders(d, label))
+        for m in re.finditer(b'NDSR', d):
+            if m.start() + 0x20 <= len(d) and d[m.start() + 4:m.start() + 6] == b'\x00\x01': out.extend(ndsr_shaders(d[m.start():], f'{label}#NDSR@{m.start():#x}'))
+        return
     for m in re.finditer(b'BNSH\0\0\0\0', d):
         if m.start() + 0x20 > len(d): continue   # too near the end for a BNSH header
         size = struct.unpack_from('<I', d, m.start() + 0x1c)[0]
@@ -2818,7 +2868,7 @@ def scan_file_in(args):
         try: pairs = unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
         return rel, uniq_keys(found), var_pairs(found) | {(a, b, 'prog') for a, b in pairs}, trees
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and d[:4] != b'NARC' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members, a NARC packed ones (cra.undo)
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and d[:4] != b'NARC' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d and b'NDVE' not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members, a NARC packed ones (cra.undo); NDVE (Ocarina of Time's movie engine) wraps bare NVN2 control sections, no BNSH
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside

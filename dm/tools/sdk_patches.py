@@ -59,6 +59,13 @@ CUTS = {
     (0x145bfc, '08fca752', '087ca052', 'AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000'),
     (0x145c68, '09fca752', '097ca052', 'AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000'),
   ],
+  # Ocarina of Time (Switch 2, v131072) sdk (SDK 22.2.8, NPLN 1.55.1): prepo telemetry. The game's "Porter" (save-porter) and movie threads send PlayReports; offline the prepo service
+  # does not exist, and the real AsyncContext then makes AsyncContext::GetCompletionEvent abort on its error path (the vtable call's result, reported as sdk+0x5a92d0). The impl's Send
+  # returns its AsyncContext by value (the caller's sret pointer arrives in x8): return an all-zero context — "nothing pending", which GetCompletionEvent takes as already complete
+  # (its null-impl branch at sdk+0x5a92f4) — and drop the report. The public PlayReport::Send (sdk+0x5a9ff0) tail-calls this; the patch covers both the import path and the SDK's own calls.
+  '1643a838814f9c10c696f930ed681e7f': [
+    (0x5aadc0, '7f2303d5ffc302d1fd7b07a9f74300f9', '1f0100f81f8100f8e00308aac0035fd6', 'PlayReportImpl::Send: return a zeroed AsyncContext (sret x8) and drop the report (offline)'),
+  ],
 }
 
 # SDK-wide function patches (dm/tools/nso_match.py): the two fixes above that hold for any game on an iPhone's small address space, for every game's sdk of a build with no CUTS
@@ -210,6 +217,10 @@ MATCH_CUTS = {'sdk': [
 # How general each patch is and could be (dm/tools/docs_patches.py "Binding", listed in docs/agents/game-patches.md): what, its binding now, the loosest it could have (goal),
 # purpose, why; blocked or kept: why the gap stays open (cannot close yet, or left open on purpose); checked: what was checked on game files (else a judgement)
 BINDING = [
+    {'what': 'PlayReportImpl::Send returns a zeroed AsyncContext and drops the report (prepo telemetry offline)', 'now': 'build', 'goal': 'sdk', 'purpose': 'runtime',
+     'checked': "the cut applied to Ocarina of Time's sdk (its only registered build); its first 16 bytes are the function's prologue, read off sdk.elf 2026-11-06",
+     'why': 'the game aborts through the real context (GetCompletionEvent); one game ships this build',
+     'blocked': 'a general rule would need the impl Send per SDK build; one build ships it so far'},
     {'what': 'node area 1 GB → 62 MB and regions of 4 MB and more aligned to 2 MB, as SDK 20: the SDK-wide rules', 'now': 'sdk', 'goal': 'sdk', 'purpose': 'address space',
      'checked': '20 registered builds rewritten byte-identical with the rules alone, 2026-10-29 and 2026-10-30; the 2 MB alignment on every sdk build on the drive, 2026-10-30',
      'why': 'one rule per reviewed implementation; every sdk build without CUTS gets them'},

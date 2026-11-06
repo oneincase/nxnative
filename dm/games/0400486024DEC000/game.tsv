@@ -1,0 +1,55 @@
+# The Legend of Zelda: Ocarina of Time (Switch 2). In bring-up: v131072 (SDK 22.2.8 built for the Switch 2, Ounce), NVN2.
+# Nintendo EPD's engine (sead / agl / gsys, Phive, Havok, NPLN 1.55.1), Havok AI/animation, CRIWARE, AV1 movies through
+# SDK 22's decoder. Modules main, subsdk0 (NintendoSDK_movie) and sdk.
+# Packed from a NUP container (scripts/pack_nup.py): the container's only package is the update, taken as the whole game
+# (its RomFS lacks the base game's npln_config.json; the run serves a stand-in through DM_ROMFS_OVERLAY, see the note).
+
+# ---- Identity ----
+title_id	0400486024DEC000
+program_id	0400486024DEC000
+
+# ---- App ----
+# the NUP carries an icon but no NACP: the name comes from the packer's label and the profile
+name	The Legend of Zelda: Ocarina of Time
+ipa	OcarinaOfTime.ipa
+app_category	public.app-category.games
+
+# ---- Versions ----
+build	v131072	?	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
+package	v131072
+shader_versions	v131072
+
+# ---- Files ----
+# every module main imports from
+modules	main subsdk0 sdk
+romfs_marker	Event/Movie/Dm_StaffCredit_0000.webm
+zip_store	.bwav:.webm:.zs:.metallib
+
+# ---- Memory ----
+# The first boot (the guesser's 0x140000000, 5 GB) gave a heap region of 2.94 GB and the game's SetHeapSize 0x18ce00000
+# (6.34 GB) OOM'd. Partitioned like Mario Kart World's (its 0x320000000 reserve holds a 4.375 GB alias, 256 MB stacks and
+# an 8 GB heap region): 12 GB here = alias 4.375 + stacks 0.25 + heap about 7.25 GB, over the request with margin.
+# The heap check measured the request; the address-region check measured alias +2.15 GB in the first 15 s of nnMain.
+mem_alias	0x118000000
+mem_stack	0x10000000
+app_pool	0x240000000
+# app_pool: the sdk is built for the Switch 2 (spec: Ounce): its 9 GB pool
+sys_resource	0x3000000
+# sys_resource: the NPDM declares 48 MB of system resource: virtual address memory on
+mem_reserve	0x300000000
+
+# ---- NPLN offline ----
+# The grpc poll strategy the game validates against {head_custom, poll, none, tail_custom} comes from getenv, whose
+# default ("all") the game's own check refuses. The base RomFS's npln_config.json (missing from the NUP's update-only
+# RomFS) would answer it; game_env answers the getenv instead. "none" trips a consistency guard in the sdk's obfuscated
+# npln config path (sdk+0x16d1e0 aborts through main's creator guard); "poll" passes.
+game_env	GRPC_POLL_STRATEGY=poll
+
+# ---- Shader split ----
+shader_groups	/Shader/=shader /Layout2Shader/=layout2shader /Effect/=effect /agl/=agl /WorldMgr/=worldmgr
+shader_note	The Legend of Zelda: Ocarina of Time shaders
+
+# ---- Graphics ----
+# agl wraps its clears in render conditions on Donkey Kong Bananza, Splatoon Raiders and Mario Kart World; the same
+# library here (to be confirmed on this game)
+render_cond	on

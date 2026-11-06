@@ -2,6 +2,10 @@
 // Cuts: nifm reports no network; socket only hooks up Initialize (returns success, creates no session), the rest of socket/ssl/friends are hooked up as failures when they come into use.
 #include "hle.h"
 #include <stdatomic.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 HLE_FORCE("_ZN2nn6socket10InitializeERKNS0_6ConfigE", "connects to the bsd socket service; offline, creates no session (cut)", Result, h_socket_Initialize, const void *cfg) { (void)cfg; return RES_OK; }
 // SDK 21 (Star Fox) inlines nn::socket::Initialize(const Config &) into the game, and the service connection is this call
@@ -48,13 +52,67 @@ typedef struct { int32_t fd; int16_t events, revents; } sk_pollfd;
 // A descriptor the host never made (it creates no socket): Star Fox's HTTP thread polls two with a zero timeout, its wake-up eventfd that failed (-1) and a garbage one, and takes any failure
 // but EINTR as fatal (main+0xbe2efc4). On a console a socket with nothing to say reports no event at the timeout, so that is the answer for every descriptor: nothing ready, the timeout
 // waited out, 0. Failing with ENETDOWN here made the loop abort
+// ---------- nn::socket::EventFd: the guest's wakeup descriptors (NPLN's grpc; SDK 22's eventfd API) ----------
+// NPLN's grpc builds its thread wakeups on EventFd / EventFdWrite / EventFdRead (its wakeup_fd_eventfd.cc;
+// Ocarina of Time's "none" poll-strategy creator aborts the game when the EventFd call fails, line 41). The
+// host backs each guest descriptor with a real pipe: Write writes the write end, Read drains the read end,
+// and Poll (dm_sk_poll) reports the read end's readiness. The offline socket layer makes no other descriptors.
+#define SK_EBADF 9                       // Horizon sockets use FreeBSD error codes (EAGAIN 35 = macOS's)
+#define SK_EAGAIN 35
+#define SK_EMFILE 24
+#define EVENTFD_BASE 0x40000000          // descriptors the host made; no real socket exists
+typedef struct { int gfd, rd, wr; } sk_evfd_t;
+static sk_evfd_t g_evfd[8]; static int g_nevfd;
+static sk_evfd_t *sk_evfd(int gfd) {
+    for (int i = 0; i < g_nevfd; i++) if (g_evfd[i].gfd == gfd) return &g_evfd[i];
+    return NULL;
+}
+HLE_FORCE("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", "a wakeup descriptor backed by a host pipe (EventFdWrite/Read, Poll)", int, h_sk_EventFd, uint64_t initval, unsigned flags) {
+    (void)flags;
+    if (g_nevfd >= (int)(sizeof g_evfd / sizeof *g_evfd)) { t_skerr = SK_EMFILE; return -1; }
+    int fds[2]; if (pipe(fds)) { t_skerr = SK_EAGAIN; return -1; }
+    for (int k = 0; k < 2; k++) { int fl = fcntl(fds[k], F_GETFL); fcntl(fds[k], F_SETFL, fl | O_NONBLOCK); }
+    sk_evfd_t *e = &g_evfd[g_nevfd];
+    *e = (sk_evfd_t){ EVENTFD_BASE + g_nevfd, fds[0], fds[1] };
+    if (initval) { uint64_t v = initval; write(e->wr, &v, sizeof v); }
+    LOG("socket: EventFd %d (host pipe %d/%d)", e->gfd, e->rd, e->wr);
+    return g_evfd[g_nevfd++].gfd;
+}
+HLE_FORCE("_ZN2nn6socket11EventFdReadEiPm", "drains the wakeup counter", long, h_sk_EventFdRead, int gfd, void *buf, unsigned long len) {
+    sk_evfd_t *e = sk_evfd(gfd);
+    if (!e) { t_skerr = SK_EBADF; return -1; }
+    ssize_t n = read(e->rd, buf, len);
+    if (n < 0) { t_skerr = errno == EAGAIN ? 35 : SK_EBADF; return -1; }
+    return (long)n;
+}
+HLE_FORCE("_ZN2nn6socket12EventFdWriteEim", "writes the wakeup counter", int, h_sk_EventFdWrite, int gfd, int count) {
+    sk_evfd_t *e = sk_evfd(gfd);
+    if (!e) { t_skerr = SK_EBADF; return -1; }
+    uint64_t v = (uint64_t)(uint32_t)count;   // a 0 count writes nothing, as eventfd(2)'s does not wake
+    if (v && write(e->wr, &v, sizeof v) != 8) { t_skerr = SK_EAGAIN; return -1; }
+    return 0;
+}
+
 int dm_sk_poll(void *fds, uint64_t n, int ms) {   // also hle_offline.c's plain pollfd form
     sk_pollfd *p = fds;
+    // The eventfd descriptors the host made (EventFd below) poll for real: grpc's poller waits on its
+    // wakeup descriptor and must see the write side's wake, not the timeout. A thread inside a host hook
+    // pauses no other work, so the wait keeps its cap: the caller re-polls (grpc's poller loops).
+    struct pollfd hp[16]; int gix[16], k = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        p[i].revents = 0;
+        sk_evfd_t *e = i < n ? sk_evfd(p[i].fd) : NULL;
+        if (e && k < 16 && (p[i].events & 1)) { hp[k] = (struct pollfd){ e->rd, POLLIN, 0 }; gix[k++] = (int)i; }
+    }
+    if (k) {
+        int r = poll(hp, (nfds_t)k, ms < 0 || ms > 100 ? 100 : ms);
+        if (r > 0) for (int j = 0; j < k; j++) if (hp[j].revents & POLLIN) p[gix[j]].revents |= 1;
+        return r < 0 && errno != EINTR ? sk_fail() : r;
+    }
     for (uint64_t i = 0; i < n; i++) if (p[i].fd >= 0) {
         static int once; if (!once++) LOG("socket: Poll of %llu descriptors with one the host never made (fd %d, events %#x; %d ms): nothing ready at the timeout", (unsigned long long)n, p[i].fd, p[i].events, ms);
         break;
     }
-    for (uint64_t i = 0; i < n; i++) p[i].revents = 0;
     return sk_idle(ms);
 }
 int dm_sk_select(int nfds, const uint64_t *r, const uint64_t *w, const uint64_t *e, const int64_t *tv) {   // fd_set: 1024 bits; timeval: {i64 seconds, i64 microseconds}
@@ -85,9 +143,6 @@ SKF("_ZN2nn6socket4PollEPNS0_6PollFdEmi", h_sk_Poll, void *f, unsigned long n, i
 // to the host's Poll too
 SKF("poll", h_libc_Poll, void *f, unsigned long n, int t) { return dm_sk_poll(f, n, t); }
 SKF("_ZN2nn6socket6SelectEiPNS0_5FdSetES2_S2_PNS0_7TimeValE", h_sk_Select, int n, void *r, void *w, void *e, void *t) { return dm_sk_select(n, r, w, e, t); }
-SKF("_ZN2nn6socket7EventFdEmNS0_12EventFdFlagsE", h_sk_EventFd, unsigned long v, int f) { (void)v; (void)f; return sk_fail(); }
-SKF("_ZN2nn6socket11EventFdReadEiPm", h_sk_EventFdRead, int s, unsigned long *v) { (void)s; (void)v; return sk_fail(); }
-SKF("_ZN2nn6socket12EventFdWriteEim", h_sk_EventFdWrite, int s, unsigned long v) { (void)s; (void)v; return sk_fail(); }
 SKF("_ZN2nn6socket17ResolverGetOptionEPNS0_14ResolverOptionENS0_17ResolverOptionKeyE", h_sk_ResGet, void *o, int k) { (void)o; (void)k; return sk_fail(); }
 SKF("_ZN2nn6socket17ResolverSetOptionERKNS0_14ResolverOptionE", h_sk_ResSet, const void *o) { (void)o; return sk_fail(); }
 HLE_FORCE("_ZN2nn6socket4RecvEiPvmNS0_7MsgFlagE", "bsd socket service (cut)", long, h_sk_Recv, int s, void *b, unsigned long n, int f) { (void)s; (void)b; (void)n; (void)f; return sk_fail(); }

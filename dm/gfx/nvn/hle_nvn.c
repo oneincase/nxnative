@@ -27,11 +27,6 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <errno.h>
-#if TARGET_OS_OSX
-#define DM_MEM_CAP_DEFAULT_GB 24
-#else
-#define DM_MEM_CAP_DEFAULT_GB 0
-#endif
 #include <pthread/qos.h>
 #include <sys/resource.h>
 #include <sys/sysctl.h>
@@ -40,6 +35,26 @@
 #include <stdatomic.h>
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
+#include <os/proc.h>   // os_proc_available_memory: the system's own headroom, for the memory watchdog
+
+// The memory watchdog's default cap (hle_nvn.c, the frame hook): the machine's own RAM less 6 GB, held between 6 and 24 GB. The constant it replaced
+// was 24 GB whatever the machine had, which on a 16 GB Mac allows a footprint no 16 GB Mac has: the Ocarina of Time opening reached 19 GB of GPU
+// allocations and 14 GB of system swap before anything held it back. A 32 GB Mac still gets the 24 GB the runaway was seen on, a 16 GB one 10 GB —
+// the same game's opening sits at 9.7 GB of footprint on a 16 GB Mac, and past that the machine itself goes: a run left at that figure ended in a
+// kernel panic four minutes later ("Memory object not found in fMemoryCountedSet", IOGPUGroupMemory.cpp), with the game's own process at 16.7 GB
+// resident. Exiting at 10 GB is the price of not taking the machine down with it.
+#if TARGET_OS_OSX
+static long DM_MEM_CAP_DEFAULT_GB(void) {
+    uint64_t bytes = 0; size_t n = sizeof bytes;
+    if (sysctlbyname("hw.memsize", &bytes, &n, NULL, 0) == 0 && bytes > (1ull << 30)) {
+        long gb = (long)(bytes >> 30) - 6;
+        return gb < 6 ? 6 : gb > 24 ? 24 : gb;
+    }
+    return 24;
+}
+#else
+static long DM_MEM_CAP_DEFAULT_GB(void) { return 0; }   // no cap on a phone: exiting before the system kills it only adds another kind of crash
+#endif
 
 // ---------- Slot table, thunks, unimplemented stubs ----------
 typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
@@ -1496,12 +1511,23 @@ static void dump_frame(void) {
     else if (g_frame % 300 == 0) LOG("[nvn] frame %llu: %u functions %llu calls", g_frame, nfn, total);
     g_frame++; cs_dump();
 counts_done:
-    // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (24 GB: runaway host memory
+    // Every 300 frames read resident memory and hand it to the graphics layer to print the memory readout line (mtl_mem_stat, low frequency, capped). Memory watchdog: when resident memory exceeds the cap, log a failure and exit on its own. On by default only on the Mac host (three quarters of the machine's RAM: runaway host memory
     // drags the whole machine into a kernel panic, which happened twice with other programs on the same machine), or set for tests with DM_MEM_CAP_GB=<integer>; the player's iOS app has no cap (exiting before the system kills it is pointless and only adds another kind of crash)
     if (g_frame % 300 == 0) { task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
-        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) { unsigned long long mb = (unsigned long long)(vi.phys_footprint >> 20); void mtl_mem_stat(unsigned long long, unsigned long long); mtl_mem_stat(g_frame, mb);
-            static long cap = -1; if (cap < 0) { const char *e = getenv("DM_MEM_CAP_GB"); cap = e ? atol(e) : DM_MEM_CAP_DEFAULT_GB; }
-            if (cap > 0 && mb > (unsigned long long)cap * 1024) { LOG("[RED] memory watchdog: resident %llu MB over the limit of %ld GB (frame %llu), exiting", mb, cap, (unsigned long long)g_frame); _exit(86); } } }
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) { unsigned long long mb = (unsigned long long)(vi.phys_footprint >> 20), rs = (unsigned long long)(vi.resident_size >> 20); void mtl_mem_stat(unsigned long long, unsigned long long, unsigned long long); mtl_mem_stat(g_frame, mb, rs);
+            static long cap = -1; if (cap < 0) { const char *e = getenv("DM_MEM_CAP_GB"); cap = e ? atol(e) : DM_MEM_CAP_DEFAULT_GB(); }
+            if (cap > 0 && mb > (unsigned long long)cap * 1024) { LOG("[RED] memory watchdog: footprint %llu MB (resident %llu MB) over the limit of %ld GB (frame %llu), exiting", mb, rs, cap, (unsigned long long)g_frame); _exit(86); }
+            // The system's own headroom, which is what a kernel panic comes from: the cap above counts this process's dirty memory, while the machine
+            // also holds the OS, the game's file-backed pages and every other app. Under 1 GB left, exit rather than let the GPU driver be the one to
+            // find out. Free + inactive + speculative is the memory the system can still hand out or reclaim
+#if TARGET_OS_OSX
+            unsigned long long av = 0;
+            { vm_statistics64_data_t vs; mach_msg_type_number_t vc = HOST_VM_INFO64_COUNT; vm_size_t ps = 0;
+              if (host_page_size(mach_host_self(), &ps) == KERN_SUCCESS && host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vs, &vc) == KERN_SUCCESS)
+                  av = (unsigned long long)(vs.free_count + vs.inactive_count + vs.speculative_count) * (unsigned long long)ps; }
+            if (av && av < (1ull << 30)) { LOG("[RED] memory watchdog: %llu MB left to the system (footprint %llu MB, resident %llu MB, frame %llu), exiting", av >> 20, mb, rs, (unsigned long long)g_frame); _exit(86); }
+#endif
+        } }
     dm_guest_frame_tick();   // Deterministic guest clock (DM_DETCLOCK, host hle_os.c): each present advances a fixed step; a no-op when not enabled
     dm_cheats_present();   // Atmosphère cheat files (hle_cheats.c): enabled cheats apply once per presented frame; the ~60 Hz idle thread only covers gaps
 }
