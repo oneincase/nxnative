@@ -66,7 +66,8 @@ def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', m
 HMMA_BODY = '''{
     threadgroup uint* s = &%(scr)s[uint(%(blk)s)];
     threadgroup half* h = (threadgroup half*)s;
-    const int f = int(%(fl)s), k = (f >> 8) * 2;
+    // %(fnote)s
+    const int f = %(fexpr)s, k = (f >> 8) * 2;
     const bool areuse = f & 1, cslot = f & 2, dslot = f & 4, czero = f & 8, adirect = %(adirect)s;
     uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
     if (!areuse && !adirect) { s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s); }
@@ -113,7 +114,7 @@ def block_end(src, start):   # the index of the brace closing the block opened a
         depth += {'{': 1, '}': -1}.get(src[i], 0)
         if depth == 0: return i
     raise ValueError('dmsh_hmma16816_f16: block not closed')
-def hmma_msl(msl):
+def hmma_msl(msl, pc=''):
     m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
     if not m: return msl
     params = split_params(m.group(2))
@@ -142,7 +143,15 @@ def hmma_msl(msl):
     shared = set(callers.values())
     direct = len(shared) == 1 and None not in shared
     extra = ', thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4]' + (', threadgroup %s& dm_shm' % next(iter(shared))[0] if direct else '')
-    v.update(adirect='(f & 16) != 0' if direct else 'false', shm_base='(threadgroup half*)&dm_shm[0]' if direct else '(threadgroup half*)nullptr')
+    # The agl NDSR networks (the upscaler families, '#NDSR@' origins) take no flags: their tiles are
+    # rewritten in shared memory inside loops, and more than one flag promise fails on the executed paths —
+    # Ocarina of Time's compose drew dotted columns with FlagAReuse alone off (areuse) and only the flagless
+    # body was clean at every state (see FlagAReuse reads a loop's first-iteration matrices).
+    # The NDVE movie networks keep their flags (the title and opening A/B'd clean on both hosts).
+    ndsr = '#NDSR@' in pc
+    v.update(adirect='(f & 16) != 0' if direct else 'false', shm_base='(threadgroup half*)&dm_shm[0]' if direct else '(threadgroup half*)nullptr',
+             fexpr='0' if ndsr else 'int(%s)' % v['fl'],
+             fnote='the agl NDSR family takes the flagless body: its tile data is rewritten in shared memory inside loops and the flag promises fail there' if ndsr else 'the flag promises hold for this shader')
     # Edits of the original text, applied from its end: the helper itself, each call's added arguments (the caller's matrices and shared memory), each caller's matrices
     edits = [(m.start(), body_end + 1, '\n%s dmsh_hmma16816_f16(%s%s)\n%s' % (m.group(1), m.group(2), extra, HMMA_BODY % v))]   # spirv-cross has it inlined (always_inline, the line before)
     edits += [(c.end() - 1, c.end() - 1, ', dm_acc, dm_am' + (', ' + callers[open_at][1] if direct else '')) for c, open_at in calls]
@@ -1492,7 +1501,7 @@ def finish(key, w, j, c1):
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
-    try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
+    try: src = hmma_msl(src, j.get('pc_paired', ''))   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None

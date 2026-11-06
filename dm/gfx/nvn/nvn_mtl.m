@@ -1443,6 +1443,7 @@ static void um_overlay(uint64_t lo, uint64_t hi, uint8_t *d, uint64_t ready) {
         if (m->page != pg || m->fence <= done) continue;
         for (uint64_t x = at; x < end; x++) if (m->f[x & 4095] > done) { if (!waited) { ubc_wait(ready); waited = 1; } d[x - lo] = m->val[x & 4095]; } }
 }
+static long g_td_frame; static const char *g_td_path; static NSMutableArray *g_td_list; static int g_td_done;   // DM_NVN_TEXDUMP (defined with the texdump below; the image-binding hook above collects storage images too)
 // The writes queued in this submission from index since on that overlap [a, b), newest first, into out (room for every entry a lookup can meet); -1 when they cannot all be told
 static int pend_since(uint64_t a, uint64_t b, int since, int *out) {
     if (g_pend_over) return -1;
@@ -8785,6 +8786,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
                                            tt->d.target == NVN_TEXTURE_TARGET_BUFFER || (tt->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ? "linear" : "block-linear", (unsigned long long)tt->L.size); }
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu fmt=%lu %lux%lu view_sl=%lu array=%lu target=%lu shader wants target %u", g_stat_pass, nvn_stage, reg, tid, real ? "real" : "dummy", real && tid < g_ntreg ? g_treg[tid].t.serial : 0ull,
                                   (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)(t.parentTexture ? t.parentRelativeSlice : 0), (unsigned long)t.arrayLength, (unsigned long)t.textureType, (unsigned)b->dtt);
+            if (t && g_td_frame >= 0 && !g_td_done && (long)atomic_load(&g_cur_frame) == g_td_frame) {   // temporary: texdump also collects compute image writes
+                uint64_t wser = real && tid < g_ntreg ? g_treg[tid].t.serial : 0; BOOL wseen = NO;
+                for (NSArray *e in g_td_list) if (e.count < 5 && [e[1] unsignedLongLongValue] == wser && [e[2] unsignedIntegerValue] == 0 && [e[3] unsignedIntegerValue] == 0) wseen = YES;
+                if (!wseen) [g_td_list addObject:@[t.parentTexture ? t.parentTexture : t, @(wser), @(0), @(0)]];
+            }
             slots[aid] = trid;
             USE(t, snap >= 0 ? MTLResourceUsageRead : MTLResourceUsageRead | MTLResourceUsageWrite);
         } else if (b->kind == NVN_RB_TBUF || b->kind == NVN_RB_TBUFU) {   // Typed buffer: the buffer texture (target BUFFER) in texture slot r, or its handle in a uniform buffer (TBUFU)
