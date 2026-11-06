@@ -654,7 +654,7 @@ Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.p
 - **sdk** `e01950c5…` ([sdk_patches.py:58](../../dm/tools/sdk_patches.py#L58)): Hollow Knight: Silksong 1.0.30000
   - cut `+0x145bfc`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x145c68`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `1643a838…` ([sdk_patches.py:66](../../dm/tools/sdk_patches.py#L66)): The Legend of Zelda: Ocarina of Time ?
+- **sdk** `1643a838…` ([sdk_patches.py:66](../../dm/tools/sdk_patches.py#L66)): The Legend of Zelda: Ocarina of Time v131072
   - cut `+0x5aadc0`: PlayReportImpl::Send: return a zeroed AsyncContext (sret x8) and drop the report (offline)
 
 ### SDK-wide function-matched rules
