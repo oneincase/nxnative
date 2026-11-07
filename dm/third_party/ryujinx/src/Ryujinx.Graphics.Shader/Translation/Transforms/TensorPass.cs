@@ -267,7 +267,10 @@ namespace Ryujinx.Graphics.Shader.Translation.Transforms
             Operand g = emit.ShiftRightU32(lane, Const(2));
             Operand t = emit.BitwiseAnd(lane, Const(3));
 
+            // the LDSM's reads fence as in ALdsm: a subgroup barrier before (the warp's stores have landed) and one after
+            emit.SubgroupBarrier();
             emit.Copy(operation.Dest, InstEmit.LdsmLane(emit, g, t, operation.GetSource(2), operation.GetSource(0).Value, operation.GetSource(3).Value, operation.GetSource(1).Value));
+            emit.SubgroupBarrier();
 
             LinkedListNode<INode> last = node;
 

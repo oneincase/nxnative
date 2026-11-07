@@ -51,6 +51,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0xb66, InstName.Tld, ATex, InstProps.Tex);
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
             x(0xb69, InstName.Tmml, ATex, InstProps.Tex);
+            x(0x36a, InstName.Tmml, ATex, InstProps.Tex);
+            x(0xf69, InstName.Tmml, ATex, InstProps.Tex);
             x(0xb6c, InstName.Txd, ATex, InstProps.Tex);
             x(0xb6f, InstName.Txq, ATxq, InstProps.Tex);
             x(0x370, InstName.Txq, ATxq, InstProps.Tex);
@@ -682,10 +684,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // 40..46. 0x361, 0x364 and 0x367 (TEX, TLD4 and TLD, bit 59 set): a register, the first of the second source block,
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
-            bool handleInB = opcode is 0x361 or 0x364 or 0x367;
-            bool bindless = handleInB || opcode is 0xf60 or 0xf63 or 0xf6c;
+            bool handleInB = opcode is 0x361 or 0x364 or 0x367 or 0x36a;
+            bool bindless = handleInB || opcode is 0xf60 or 0xf63 or 0xf69 or 0xf6c;
 
-            if (opcode is 0xf60 or 0xf63 or 0xf6c)
+            if (opcode is 0xf60 or 0xf63 or 0xf69 or 0xf6c)
             {
                 int ur = x.Bits(40, 46);
 
@@ -694,7 +696,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = opcode is 0xf63 or 0xf6c ? opcode - 0x400 : opcode is 0x364 or 0x367 ? opcode + 0x7ff : 0xb60;
+                opcode = opcode is 0xf63 or 0xf69 or 0xf6c ? opcode - 0x400 : opcode is 0x364 or 0x367 or 0x36a ? opcode + 0x7ff : 0xb60;
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));
