@@ -2,6 +2,8 @@
 
 The Switch 2 base dump reaches its title screen on the Mac. VideoToolbox decodes the 1920×1080 AV1 track. The movie library runs its NDVE compute shaders to produce the background behind the logo and menu. Gameplay validation is open.
 
+> **This page is the upstream bring-up record.** The iPhone and Mac work of the kid with sword remake fork (its V1–V16 iPhone builds, V13 the last run on a phone, and its own profile and touch controls) has its own page: [docs/games/kid-with-sword-remake.md](../../../docs/games/kid-with-sword-remake.md). The findings below stand as that bring-up recorded them, on the Mac.
+
 ## Profile
 
 SDK 22.2.8, NVN API 231.40, with Nintendo's sead, agl and gsys. The three loaded modules are `main`, `subsdk0` (NintendoSDK_movie), and `sdk`. The NPDM declares 48 MiB of system resources. Startup requests a 6.20 GiB heap, which fits in the profile's 12 GiB reservation with the stack and alias regions. The registered build is the supplied base dump (`v0`).
@@ -120,7 +122,7 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - The `pipeline archive` red line is [issue 342](https://github.com/seedds/nxnative/issues/342), a limit of this system build. `c1_full.tsv is stale` holds on partial libraries, which no full build has stamped.
 - The "Navi" name label in the Great Deku Tree scene was missing on an earlier chain and has not been checked since. Not played yet: the Deku Tree dungeon, combat, later areas. Sound opens with no red line; movies and speech were not listened to. Physics issues reported in PR 1299 were not seen on this route (walking, the ladder, the camera).
 - Open: dotted horizontal rows across the picture in play, in fog and light (GitHub issue 1537, an M5 Ultra; reproduced on the M4 Pro from the Kokiri Forest autosave), with the game's upscaler and with `DM_UPSCALER=metalfx` alike. Chain adec7d81d970 with its host draws the same view clean; chain 844bf1a5ea8f does not, with main's host or with 04df08d4's, so the cause lies between 6121fd75 and 04df08d4 (chain changes 0f510fd5, bd9f422d, 9c2fb0c9, 04df08d4, and the host commits among them). No shader in the seen list is new to that chain. Under the game's upscaler these rows also grew into white blotches over the whole picture: that part was [LDSM reads rows other lanes stored](../../../docs/reference/shaders.md#ldsm-reads-rows-other-lanes-stored), fixed.
-- No iOS shader build or iPhone run has been done. Its memory use makes an iPhone unlikely as it stands.
+- No iOS shader build or iPhone run is recorded here. The upstream profile's memory use makes an iPhone unlikely as it stands; the fork's page has its own iPhone builds and profile ([kid with sword remake](../../../docs/games/kid-with-sword-remake.md)).
 
 ## Found on this game
 
@@ -138,6 +140,7 @@ From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. F
 - [Task and mesh shaders in BNSH, and indirect mesh draws](../../../docs/reference/shaders.md#task-and-mesh-shaders-in-bnsh-and-indirect-mesh-draws)
 - [F2IP](../../../docs/reference/shaders.md#f2ip)
 - [LDSM reads rows other lanes stored](../../../docs/reference/shaders.md#ldsm-reads-rows-other-lanes-stored): white blotches over Kokiri Forest through agl's upscaler on an M4 Pro.
+- [An upscaler chain ending at another network](../../../docs/reference/rendering.md#an-upscaler-chain-ending-at-another-network): with `DM_UPSCALER=metalfx` at the game's own 1440x810 the 3D world came out black under the HUD, as observed on 2026-11-07; the host draws the chain's last stage from the first stage's colour and refuses a chain that ends at another network. Picture check open.
 - [A shader that writes a whole frame through raw global memory](../../../docs/reference/frame-rate.md#a-shader-that-writes-a-whole-frame-through-raw-global-memory)
 - [Memory pools nothing gave an address to stay out of the raw pool table](../../../docs/reference/memory.md#memory-pools-nothing-gave-an-address-to-stay-out-of-the-raw-pool-table)
 - [Shaders report which textures they read through a pool](../../../docs/reference/memory.md#shaders-report-which-textures-they-read-through-a-pool)
