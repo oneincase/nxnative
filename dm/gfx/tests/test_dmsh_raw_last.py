@@ -27,7 +27,7 @@ MAC_METAL = scope['MAC_METAL']
 LDG = (0x000ea200081e890f, 0x0000000405067981)   # LDG.E R6, [R5.64 + UR4]: R5 the thread index, an address the translator traces to no storage buffer
 HELPER = re.compile(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, const device (_\d+)& \w+, thread uint& (_\d+)\)\n\{\n')
 
-# The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, 0}, sorted by start,
+# The pool table as the host writes it (nvn_mtl.m gmem_map, dmsh_abi.h DMSH_GMEM_MAP_*): 8,192 entries of 8 words {start lo, start hi, end lo, end hi, delta lo, delta hi, hint chunk, hint entry}, sorted by start,
 # entry 0 empty, unused entries starting at ~0. Pools A and B are adjacent, C lies past a gap and above 4 GiB, and its 2 MiB chunk has a hint naming it (the only pool there; the gap after it is in
 # the chunk too, so the hint's entry does not hold that address)
 RUNNER = '''#import <Metal/Metal.h>
@@ -47,7 +47,7 @@ int main(int ac, char **av) { @autoreleasepool {
         pool[p] = [d newBufferWithLength:WORDS * 4 options:MTLResourceStorageModeShared]; uint32_t *w = pool[p].contents; for (int i = 0; i < WORDS; i++) w[i] = value(p, i * 4);
         uint64_t s = GUEST[p], end = s + WORDS * 4, delta = pool[p].gpuAddress - s, *ent = (uint64_t *)(t + (p + 1) * 8); ent[0] = s; ent[1] = end; ent[2] = delta;
     }
-    uint32_t chunk = (uint32_t)(GUEST[2] >> 32) << 11 | (uint32_t)GUEST[2] >> 21; t[(chunk & 8191) * 8 + 6] = 3 | chunk << 13;   // C's chunk: entry 3
+    uint32_t chunk = (uint32_t)(GUEST[2] >> 32) << 11 | (uint32_t)GUEST[2] >> 21; t[(chunk & 4095) * 8 + 6] = chunk; t[(chunk & 4095) * 8 + 7] = 3; t[4] = 8192;   // C's chunk: entry 3, in this tree's layout (dmsh_abi.h: the hint's chunk number in word 6, its entry in word 7, of the entry its low 12 bits pick; the entry count in entry 0's delta)
     // each lane: a word walk in A, B right after A, back to A, a gap, C above 4 GiB (through the hint), the gap after C in its chunk, C again, B, entry 0's range, A
     static const int64_t SEQ[STEPS][2] = {{0, 0}, {0, 4}, {0, 8}, {1, 0}, {1, 4}, {0, 12}, {-1, 0x10002000}, {2, 0}, {2, 4}, {-1, 0x200041000}, {2, 8}, {1, 8}, {-1, 0}, {-1, 0xfff}, {0, 16}, {0, 20}};
     id<MTLBuffer> addr = [d newBufferWithLength:LANES * STEPS * 8 options:MTLResourceStorageModeShared], out = [d newBufferWithLength:LANES * STEPS * 4 options:MTLResourceStorageModeShared];

@@ -1,6 +1,4 @@
-# The Legend of Zelda: Ocarina of Time (Switch 2, update v131072)
-# Nintendo EPD's engine (sead / agl / gsys, Phive; project Owl, the Tears of the Kingdom engine's file layout), SDK 22.2.8 built for the Switch 2 (Ounce), NVN2 (Ampere shaders); modules main + subsdk0 (movie) + sdk.
-# Packed from a NUP container (scripts/pack_nup.py). Shaders: Shader/*.Nin_Ounce_NVN2.bfsha.zs (BNSH with Ampere code).
+# The Legend of Zelda: Ocarina of Time (Switch 2), base dump. Nintendo SDK 22.2.8, NVN2.
 
 # ---- Identity ----
 title_id	0400486024DEC000
@@ -8,9 +6,8 @@ program_id	0400486024DEC000
 
 # ---- App ----
 name	The Legend of Zelda: Ocarina of Time
-ipa	ZeldaOcarinaOfTime.ipa
-app_category	public.app-category.adventure-games
-pad_layout	full
+ipa	OcarinaOfTime.ipa
+app_category	public.app-category.games
 
 # ---- Versions ----
 build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
@@ -19,28 +16,79 @@ shader_versions	v131072
 
 # ---- Files ----
 modules	main subsdk0 sdk
-romfs_marker	Pack/ZsDic.pack.zs
-zip_store	.zs:.bwav:.webm:.metallib
+romfs_marker	Event/Movie/Dm_StaffCredit_0000.webm
+zip_store	.bwav:.webm:.zs:.metallib
+
+# In the NUP at hand three RomFS files begin with 12 KB of zeros (the container's SHA-256 of them matches, so they were so when it was packed; whether a retail copy has them is not known), so they cannot be decompressed. Served as stored, the fairy
+# fountain model that uses the first never loaded and the OptimizeChangeBanc thread (main+0xf7a0) asked for it again ~22 times a second all session: one core, plus ~0.75 core of
+# ParallelDecompThread decompressing the 2.4 MB model each time (Mac CPU 365%, iPad 400-460%). "Not found" fails the model the same way. Served as the game's own 1x1 flat normal map, the
+# model loads once and both threads go idle (Mac CPU 412% -> 180%, frame p95 21.9 -> 18.8 ms). The Ganon stage bake is served as its neighbour cell's (not checked in game). A copy without the damage
+# needs none of this: the host substitutes only a .zs file that is not a zstd stream (hle_fs.c img_serve)
+romfs_substitute	Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx.zs=Tex/Dummy_Flat_Normal_CmnTex_Chara_DetailMap_Nrm.bntx.zs Tex/Rock_WaterTemple_Gate_M_01_Nrm.bntx.zs=Tex/Dummy_Flat_Normal_CmnTex_Chara_DetailMap_Nrm.bntx.zs Tex/RBake_Scene_GanonStage_G_2_1_d0_t0.bntx.zs=Tex/RBake_Scene_GanonStage_G_2_2_d0_t0.bntx.zs
 
 # ---- Memory ----
-# The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
-# nninitStartup asks SetHeapSize 0x18ce00000 (6.2 GB) with the 9 GB pool, as Mario Kart World. 256 MB in front + 4 GB alias region + 256 MB stack region + 8 GB heap region: a starting split, to be measured
-mem_reserve	0x320000000
-mem_alias	0x100000000
+# The NPDM declares 48 MiB of system resources. Startup requests a 6.20 GiB heap.
+# The alias region holds the game's streaming allocator (main+0x7ed630): in Kokiri Forest it maps up to +4.5-4.75 GB of address regions (an 8 GB region, Mac runs v6c, spin1).
+# With 2.38 GB (0x98000000) the allocator stops at +2.26 GB: the loader retries what does not fit, so the OptimizeChangeBanc thread (main+0xf7a0, a sead::Thread whose pass sleeps 16 ms
+# only when all is loaded) spins a whole core (997 ms/s, process CPU 308% against 168%, same host, Mac run alias238; every iPhone run), and after 5-15 minutes outdoors
+# VammManager::AllocateAddressRegion fails and the game aborts (the Mighty Green Kokiri Kid fork). 8 GB as in that fork; the reserve grows by the same 5.6 GB so the heap keeps its size.
+# The iPhone 18 Pro already reserved 12 GB plus 12 GB of guest files; DM_ALIAS_SIZE=0x98000000 in Documents/env.txt goes back to the small region
+mem_reserve	0x468000000
+mem_alias	0x200000000
+# A map that would take the process past the application pool fails with ResultLimitReached, as on Horizon: the SDK's allocator keeps freed pages mapped until a map fails,
+# then gives them back. Without it PR #1444 reports crashes entering Hyrule Castle, Kakariko Village and Death Mountain and a black screen leaving the Deku Tree
 mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000
 
-# ---- Shader split (shader_split.py) ----
-shader_groups	/Shader/=shader /Effect/=effect /Lib/=lib /UI/=layout
-shader_note	Ocarina of Time shaders
+# ---- Shader split ----
+shader_groups	/Shader/=shader /Lib/=lib /Effect/=effect /Layout2Shader/=layout /Movie/=movie
+shader_note	0400486024DEC000 shaders
 
 # ---- Graphics ----
-# agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here
+# agl wraps its depth clears in render conditions, as on Donkey Kong Bananza and Splatoon Raiders: in Kokiri Forest the main opaque pass tests EQUAL against a copy of the prepass depth
+# that a conditional clear (skipped on the console) wiped first, so no lit geometry landed and the full-screen sky showed through everywhere (a white scene)
 render_cond	on
+
+# The RAM swap is upstream's DM_GUEST_FILE (on by itself on iOS when the memory pool does not fit the room to the limit); its memory pools stay anonymous (hle_svc.c dm_guest_pool_anon)
+# Raw global memory: compressible (render-target storage), shader code and GPU no-access pools are kept out of the pool table, which made every pool resident (nvn_mtl.m mtl_pool_noraw)
+gmem_skip	on
+# Pool tables give a finalized texture ID with no view the dummy instead of making its texture again: about 2.5 GB at the house-to-forest change (upstream #1393, nvn_mtl.m pool_skip_retired)
+pool_skip_retired	on
+# Guest copies of textures in CPU_NO_ACCESS pools (render and depth targets the game cannot read) given back once their GPU copy exists (upstream #1447, nvn_mtl.m rel_*): about 550 MB outdoors.
+# 2: also CPU-visible copies, pages unwritten since their upload (1.85 GB more in Kokiri Forest: peak 7.0 → 5.2 GB with the iPhone's guest files); no texture lost and no problem seen in a 4-minute play test
+tex_release	2
+# Large block-compressed textures from the game files kept without their finest level on the GPU (tex_soft, ported from the plumber-racer-2 fork)
+tex_soft	on
+# rt_drop (render targets taken over by a later-drawn one become 1x1 stand-ins, nvn_mtl.m rtd_sweep) is off: footprint 8.9 → 7.1 GB at the Kokiri Forest doorway, but the game still
+# samples textures the sweep took for dead (on the title screen 278 of about 300 stand-ins were drawn again): textures and objects popped on and off, surfaces swayed and some were missing
+rt_drop	off
+# Handheld, as the iPhone runs it (the game presents 1920x1080 instead of 2048x1152 docked)
+op_mode	handheld
+# Render pipelines through Metal 4 on the iPhone too, as on the Mac: the pipeline archive and hybrid pipelines (a draw starts with a ready base instead of waiting for its own pipeline).
+# With it off, every pipeline the game first used compiled on the submit thread: on an iPhone 18 Pro the opening cutscene's transitions froze for 0.2-1.3 s each. The IPA carries no
+# offline archive (the A20's architecture name is not known here); the launcher's pipeline prebuild builds the bases once on the first start and keeps them
+pso_mtl4	on
+# Frame rate: the host steps the game in whole vsyncs (patches.py FRAME_STEP: the frame-rate controller's interval and fps follow the host's step), so the launcher's Frame rate
+# setting offers 30 and 60. At 30 every frame is held two vsyncs (33.3 ms) and the game's own 30 fps mode steps its time by two, so it runs at full speed
+fps_target	60
+# The iPhone's touch gamepad starts in the full (3D) layout: the D-pad, L3 / R3 and the right stick, which turns the camera (a drag in the right third of the screen); the simple
+# layout has no right stick. A layout the player switches to in the game menu is kept
+pad_layout	native
+# The touch controls' Forest colours: blue A, green B, yellow X / Y, red +, deep green shoulders, bronze D-pad, gold rims, all translucent (DmGamepad.m theme_init)
+pad_theme	forest
+# Dynamic resolution reads the GPU time between the frame's timestamp reports, as on Donkey Kong Bananza and Breath of the Wild (the same EPD engine family): with one time a submission it
+# read about 0 and kept the full 1440x810 at 20-24 ms of GPU a frame on a MacBook Air M5. Each report takes its segment's GPU start / end (nvn_mtl.m rep_ticks)
 gpu_timestamps	segment
-draw_barriers	game
-# As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
-tex_flush_upload	on
-tex_dirty_upload	on
+# The game upscales through a chain: agl_ndsr_vr feature pass, network and blend at the render size, agl_ndsr_vr_light scale to 1920x1080. DM_UPSCALER=metalfx skips the chain for MetalFX (nvn_mtl.m up_chain)
+upscaler_chain	f8965bffbdf51d78,d17eefaff4f0bc23,a335c1db6270c355>aad7ea7e5c02f41d|b106afba1a18faa9|fa3033d05c0a41d6|04135bb812a0d66e|8df148d58b7cbe8e
+# Colour render targets drawn only as attachments (RGBA8 / BGRA8 / RGBA16F) kept with Metal lossy compression (rt_lossy, nvn_mtl.m rt_lossy): about 100 MB less in Link's house at 720p;
+# the scene colour (RG11B10F) and depth have no lossy form
+rt_lossy	on
+# The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): 117 at the start of a frame in Kokiri Forest waited each for the one
+# before, 5.7 ms; side by side 3.7 ms, the frame 27.1 -> 24.9 ms (docked, Apple M4 Pro), the picture within run-to-run noise (from the Mighty Green Kokiri Kid fork, 5208584a)
+dispatch_overlap	off
+res_presets	on
+frame_wg	off
+present_snap	on

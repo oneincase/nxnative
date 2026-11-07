@@ -34,8 +34,8 @@ if not TARGETS or not TARGETS <= {'mac', 'ios'}: sys.exit(f'[RED] DMSH_TARGETS t
 if 'ios' in TARGETS and not IOSOUT: sys.exit('[RED] DMSH_TARGETS asks for iOS libraries without IOSOUT')
 if 'ios' not in TARGETS: IOSOUT = None   # every side library, cache, cleanup and stamp follows the same selection
 IOS_PULL = os.environ.get('DMSH_IOS_PULL') != '0'   # DMSH_IOS_PULL=0: no iOS pulling libraries, when nothing in the app reads them (the NSP script's ios_wants_pulling). The reflection is the same: its 'pull' comes from the variant, not from the compile
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal   # also for the Mac compile's bracket depth (ios_metal.metal_command)
 if IOSOUT:
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
 for _d in [out] + ([IOSOUT] if IOSOUT else []):   # one chain version serves every game, so b-<V>/ alone does not keep two games' libraries apart
     _g = dmsh_chain.read_stamp(_d).get('game')
@@ -399,7 +399,7 @@ MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # before the MSL compile cache can check their compiler. Keep override builds separate there too.
 METAL_FP = dmsh_mtlcache.compiler_id('macosx') + ('\0iphoneos\0' + dmsh_mtlcache.compiler_id('iphoneos') if IOSOUT else '')
 def mac_compile(msl, air, lib):   # same interface as ios_metal.compile; the precompiled header changes no output, so MAC_RECORD does not name it (dmsh_pch.py)
-    dmsh_pch.compile(MAC_METAL, msl, air)
+    dmsh_pch.compile(ios_metal.metal_command(MAC_METAL, msl), msl, air)   # -fbracket-depth only for a source nested past clang's limit (ios_metal.DEEP)
     subprocess.run(['xcrun', '-sdk', 'macosx', 'metallib', air, '-o', lib], check=True)
 # The NVN driver's constant segments have one layout in every game, which dm/gfx/nvn/dmsh_abi.h holds for the host and this build (through dmsh_abi.py); nvn_mtl.m fills them the same way at run time.
 #   c2 C2_TEX + 8 r: handles bound with nvnCommandBufferBindTexture (combined texture and sampler), slot r. The driver has 32 such slots, but a game may bind higher ones, whose words lie in the
@@ -1100,6 +1100,14 @@ def reflect(key, stage, msl, res):
             e['rw'] = bool(b and b['flags'] & 1)   # BufferUsageFlags.Write; Program.cs serializes the translator enum unchanged (atomics count as writes too)
     return binds
 
+def raw_log_opt(key, stage, src, res):
+    if not any(b['cb_slot'] == abi.GMEM_MAP_CB_SLOT and b['cb_offset'] == abi.GMEM_LOG_CB_OFFSET for b in res['sbufs']):
+        return src
+    for b in reflect(key, stage, src, res):
+        if b['kind'] == abi.KIND_GMEM_LOG:
+            return dmsh_atomic.raw_log_or(src, b['msl_name'])
+    return src
+
 DRV_FILL = {0: [(b, b + abi.C0_ROW * abi.C0_SSBO_SLOTS) for k, b in sorted(SSBO.items(), key=lambda kv: kv[1]) if k not in ('ts', 'ms')],   # c0: storage buffer address tables (vertex / compute / geometry / pixel; a task or mesh stage's: unfillable())
             2: [(TEX_BASE, SEPTEX_BASE), (IMG_BASE, IMG_BASE + abi.C2_ROW * IMG_SLOTS), (SEPTEX_BASE, SAMP_BASE), (SAMP_BASE, SAMP_BASE + abi.C2_ROW * abi.C2_SEP_SLOTS)]}   # c2: the handle tables above, all filled by the replay layer
 
@@ -1489,8 +1497,9 @@ def geometry_finish(key, w, j, c1):
         r = subprocess.run([SPIRV_CROSS, *dmsh_atomic.cross_args(XC, spv), spv], capture_output=True, text=True)
         if r.returncode: return 'geometry MSL failed', r.stderr.strip()[:160], None
         plain = dmsh_geometry.topology_pointer(pool_arrays(precise(dmsh_atomic.check_msl(r.stdout))))
-        src = dmsh_geometry.capture_input(plain)
         res = json.load(open(os.path.join(w, k + '.res.json')))
+        plain = raw_log_opt(key, 'gs', plain, res)
+        src = dmsh_geometry.capture_input(plain)
         refl = {'key': key + '_bg' + str(t), 'route': 'B', 'chain': CHAIN, 'dm_ctl': key,
                 'source': f'{loc[key][0]}#{loc[key][1]}', 'pc_paired': pc_of[key], 'stage': 'gs',
                 'entry': 'main0', 'msl_entry_kind': 'kernel', 'threadgroup_size': [32, 1, 1],
@@ -1567,6 +1576,9 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
+    res = json.load(open(os.path.join(w, key + '.res.json')))
+    try: src = raw_log_opt(key, j['stage'], src, res)
+    except ValueError as e: return 'reflection failed', str(e)[:160], None
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
     src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
     first, spill = [], 0
@@ -1587,7 +1599,6 @@ def finish(key, w, j, c1):
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
     lay = None; discard = False
-    res = json.load(open(os.path.join(w, key + '.res.json')))
     if j['stage'] == 'vs':   # the two depth-convention entry points (see vs_depth); the analysis below uses the source with only main0
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)

@@ -32,8 +32,16 @@ int main(void) { @autoreleasepool {
     mtl_tex_release(&a);
     CHECK(!held(ta) && shared(ta), "the finalized object's texture is no longer held, and stays shared until its storage is taken");
     for (int i = 0; i <= ALIAS_IDLE; i++) next_submission();
+    uint64_t taken0 = g_alias_taken, g0 = atomic_load(&g_ser_gen);
     id<MTLTexture> tc = tex_mtl(&c);
     CHECK(tc && !shared(ta), "a texture nothing resolves to goes when another description takes its storage");
+    {   // the takeover's change of storage: a note naming no texture with pool_skip_retired (pool tables are kept or patched), a bare bump without it (built whole)
+        uint64_t g1 = atomic_load(&g_ser_gen); int zero = 0, bare = 0;
+        for (uint64_t g = g0 + 1; g <= g1; g++) { const ser_lnote *sn = &g_ser_log[g % SER_LOG]; if (sn->gen != g) bare++; else if (!sn->serial) zero++; }
+        CHECK(g_alias_taken > taken0, "the takeover is counted");
+        if (pool_skip_retired()) CHECK(zero == 1 && !bare, "with pool_skip_retired the takeover leaves a note naming no texture");
+        else CHECK(!zero && bare == 1, "without pool_skip_retired the takeover's bump has no note");
+    }
     CHECK(shared(tb) && shared(tc), "the live objects' textures stay");
 
     // Two serials naming one object: held until both go

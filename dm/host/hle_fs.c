@@ -105,8 +105,7 @@ static int save_txn_from_path(const char *hp) {
 }
 // The default weak implementation only logs (Mac); the iOS front end provides a strong implementation of the same name that shows a native alert. Called on the game thread, the front end switches to the main thread itself
 __attribute__((weak)) void front_save_failed(int err) { LOG("front_save_failed(errno=%d): no front end attached (default weak implementation)", err); }
-// DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest).
-// A read of a RomFS image entry logs "?" for the path and its offset *in the image* (its entry's start plus the file offset the game asked for), which dm/tools/fslog_paths.py turns back into the file's path
+// DM_FSLOG=<file>: each ReadFile logs one TSV line "seconds since boot\tguest path\toffset\tlength\tguest buffer address" (which bytes boot read, for offline reverse lookup against the manifest)
 static FILE *g_fslog; static char *g_fdpath[4096]; static pthread_mutex_t g_fslog_lock = PTHREAD_MUTEX_INITIALIZER;
 static void fslog_init(void) { static int done; if (done) return; done = 1; const char *e = getenv("DM_FSLOG"); if (e && !(g_fslog = fopen(e, "w"))) die("cannot open DM_FSLOG %s", e); if (g_fslog) setvbuf(g_fslog, NULL, _IOLBF, 0); }   // line-buffered: runs end at the time-limit alarm or a crash, which never flush stdio
 
@@ -186,6 +185,24 @@ static int img_path(const char *p, int *mi, int64_t *k) {
     }
     return 0;
 }
+// DM_ROMFS_OVERLAY's folders, each preceded by its subfolder for the console mode (docked/ or handheld/) when it has one: game file replacements that differ by mode
+// (Ocarina of Time's resolution table: 1280x720 handheld, 1920x1080 docked). Taken when the RomFS mounts, so a later change of the operation mode does not swap files the game already read
+__attribute__((weak)) int dm_opmode(void) { return 0; }   // hle_oe.c's (the console mode); the file-system tests link no hle_oe.c: handheld
+static void rom_overlay_set(char *dst, size_t n, const char *env) {
+    char *roots = strdup(env); if (!roots) die("rom overlay allocation failed");
+    const char *mode = dm_opmode() == 1 ? "docked" : "handheld"; char *save = NULL; dst[0] = 0;
+    // DM_RES_PRESET=1 (the launcher's Resolution: Potato): potato-<mode>/ in place of <mode>/ where a folder has it (Ocarina of Time: 0.75 of the base, with the graphics scale
+    // tier 2 that hle_oe.c answers for Potato: 960x540 into a 1280x720 frame, against Normal's 1280x720 into 1920x1080), for a steadier frame rate on a hot phone; 0 (Normal,
+    // the default) or a folder without it keeps <mode>/
+    const char *pe = getenv("DM_RES_PRESET"); int potato = pe && (atoi(pe) == 1 || !strcmp(pe, "potato"));
+    for (char *root = strtok_r(roots, ":", &save); root; root = strtok_r(NULL, ":", &save)) {
+        char sub[1100]; struct stat st; snprintf(sub, sizeof sub, "%s/potato-%s", root, mode);
+        if (!potato || stat(sub, &st) || !S_ISDIR(st.st_mode)) snprintf(sub, sizeof sub, "%s/%s", root, mode);
+        if (!stat(sub, &st) && S_ISDIR(st.st_mode)) { if (dst[0]) strlcat(dst, ":", n); strlcat(dst, sub, n); LOG("fs rom overlay: %s for the %s mode%s", sub, mode, potato ? " (resolution preset Potato)" : ""); }
+        if (dst[0]) strlcat(dst, ":", n); strlcat(dst, root, n);
+    }
+    free(roots);
+}
 static void save_old_names(const char *from, const char *to);
 static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     pthread_once(&g_txn_lock_once, txn_locks_init);
@@ -198,13 +215,8 @@ static Result mount_ex(const char *name, const char *dir, int ro, int txn) {
     g_mnt[g_nmnt].txn_root = -1;
     atomic_store(&g_mnt[g_nmnt].poison, 0);
     atomic_store(&g_mnt[g_nmnt].first_write_ns, 0);
-    // DM_ROMFS_OVERLAY serves every read-only content mount, not just the one called "rom": a game can mount its
-    // content under several names, and files only some of them expect are then missing everywhere else
-    // (Ocarina of Time mounts its RomFS as "content" and again as "_npln", whose npln_config.json the update's
-    // RomFS alone does not hold; the SDK then runs on a built-in default the game's own check refuses).
-    // Saves (txn) never take an overlay.
-    const char *overlay = ro && !txn ? getenv("DM_ROMFS_OVERLAY") : NULL;
-    if (overlay) strlcpy(g_mnt[g_nmnt].overlay, overlay, sizeof g_mnt[0].overlay);
+    const char *overlay = !strcmp(name, "rom") ? getenv("DM_ROMFS_OVERLAY") : NULL;
+    if (overlay) rom_overlay_set(g_mnt[g_nmnt].overlay, sizeof g_mnt[0].overlay, overlay);
     // The transaction directory cannot be set up (leftovers cannot be cleared / clone failed, which really happens on a full disk): do not exit; mount the committed directory read-only -- saves still read, every write fails, commits are no-ops, the committed version is untouched, and the front end is told
     // (each of these three failures used to call die: with the phone's storage full the game exited as soon as it mounted its saves)
     int txn_err = 0, k = 0;
@@ -492,7 +504,7 @@ HLE_FORCE("_ZN2nn2fs8MountRomEPKcPvm", "fsp-srv; rom → host RomFS directory", 
     if (r == RES_OK && overlay) {
         PATH_LOCK();
         for (int i = 0; i < g_nmnt; i++) if (!strcmp(g_mnt[i].name, name)) {
-            strlcpy(g_mnt[i].overlay, overlay, sizeof g_mnt[i].overlay); break;
+            rom_overlay_set(g_mnt[i].overlay, sizeof g_mnt[i].overlay, overlay); break;
         }
     }
     return r;
@@ -790,6 +802,62 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op;
 }
 
 // ---------- Files ----------
+// A RomFS image file named *.zs that does not begin with a zstd frame (or a skippable frame) cannot be decompressed. Such a file is served as the substitute the profile key
+// romfs_substitute names for it (<damaged path>=<substitute path> pairs, image paths without the mount; DM_ROMFS_SUBST replaces the profile's list), else answered "path not found", as a file
+// the dump lacks; one [RED] line names it. Ocarina of Time (Switch 2), the NUP at hand: Tex/CmnTex_Map_Soil_FairyFountain_Floor_D_Nrm.bntx.zs, Tex/Rock_WaterTemple_Gate_M_01_Nrm.bntx.zs and
+// Tex/RBake_Scene_GanonStage_G_2_1_d0_t0.bntx.zs begin with 12 KB of zeros (the container's SHA-256 of them matches: they were so when it was packed; whether a retail copy has them is not known). Served as stored, the fairy fountain model that uses
+// the first (Model/Land_FairyFountain_Base_A.Land_FairyFountain_Base_A_01.bfres) failed to load, and the OptimizeChangeBanc thread (main+0xf7a0) asked for it again about 22 times a second for
+// the whole session: its pass over the 852 entries of the area never ended "all done", so it never went back to its 16 ms sleep (one core, ~980 ms/s, on the Mac and the iPad), and a
+// ParallelDecompThread decompressed the 2.4 MB model each time (~750 ms/s). "Not found" fails the model the same way (the game then asks for the .bntx, also missing); the game's own 1x1 flat
+// normal map (Tex/Dummy_Flat_Normal_CmnTex_Chara_DetailMap_Nrm.bntx.zs) in its place loads the model once, and both threads go idle: Mac CPU 412% -> 180% (medians of 5-minute runs).
+// Checked once per entry, at its first open or entry type (4 bytes); DM_ROMFS_ZSTD_CHECK=0 serves such files as stored
+#define IMG_ENT_ZCHECKED 4   // in memory only: the zstd head check has run for this entry
+#define IMG_ENT_BADZSTD 8    // in memory only: ... and found no zstd frame at the start
+#ifndef DM_GAME_ROMFS_SUBST
+#define DM_GAME_ROMFS_SUBST ""
+#endif
+static int64_t img_subst(mount_t *m, const char *path, const char **donor, int *dlen) {   // the substitute entry for a damaged path (-1: none named, or not in the image)
+    const char *c = strchr(path, ':'), *rest = c ? c + 1 : path, *s = getenv("DM_ROMFS_SUBST");
+    while (*rest == '/') rest++;
+    if (!s) s = DM_GAME_ROMFS_SUBST;
+    size_t rl = strlen(rest);
+    while (*s) {
+        while (*s == ' ' || *s == '\t') s++;
+        const char *end = s + strcspn(s, " \t"), *eq = memchr(s, '=', (size_t)(end - s));
+        if (eq && (size_t)(eq - s) == rl && !memcmp(s, rest, rl)) {
+            char d[1024]; snprintf(d, sizeof d, "/%.*s", (int)(end - eq - 1), eq + 1);
+            if (donor) { *donor = eq + 1; *dlen = (int)(end - eq - 1); }
+            int64_t k = img_find(m->img, d);
+            return k > 0 && m->img->e[k].type ? k : -1;
+        }
+        s = end;
+    }
+    return -1;
+}
+// The entry to serve for entry k: k itself, a damaged file's substitute, or -1 (answered "not found")
+static int64_t img_serve(mount_t *m, int64_t k, const char *path) {
+    img_ent *ent = &m->img->e[k];
+    const char *nm = m->img->names + ent->name;
+    if (!ent->type || ent->nlen <= 3 || memcmp(nm + ent->nlen - 3, ".zs", 3)) return k;   // other files keep their flags as they are
+    uint8_t f = __atomic_load_n(&ent->flags, __ATOMIC_ACQUIRE);
+    if (f & IMG_ENT_ZCHECKED) return f & IMG_ENT_BADZSTD ? img_subst(m, path, NULL, NULL) : k;
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_ROMFS_ZSTD_CHECK"); on = !(e && *e == '0'); }
+    int bad = 0; int64_t r = k;
+    if (on && ent->b >= 4) {
+        uint8_t h[4];
+        if (romfs_image_read(m->img->fd, h, 4, (off_t)ent->a)) {
+            uint32_t mg = (uint32_t)h[0] | (uint32_t)h[1] << 8 | (uint32_t)h[2] << 16 | (uint32_t)h[3] << 24;
+            bad = mg != 0xFD2FB528u && (mg & 0xFFFFFFF0u) != 0x184D2A50u;
+            if (bad) {
+                const char *d = NULL; int dl = 0; r = img_subst(m, path, &d, &dl);
+                if (r >= 0) LOG("[RED] fs %s is not a zstd stream (begins %02x %02x %02x %02x; damaged): served as %.*s (romfs_substitute)", path, h[0], h[1], h[2], h[3], dl, d);
+                else LOG("[RED] fs %s is not a zstd stream (begins %02x %02x %02x %02x; damaged): answered \"not found\"%s (DM_ROMFS_ZSTD_CHECK=0 serves it as stored)", path, h[0], h[1], h[2], h[3], d ? ", its substitute is not in the image" : "");
+            }
+        }
+    }
+    __atomic_fetch_or(&ent->flags, (uint8_t)(IMG_ENT_ZCHECKED | (bad ? IMG_ENT_BADZSTD : 0)), __ATOMIC_RELEASE);
+    return r;
+}
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) { dm_thread_service_request();
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) {
@@ -799,6 +867,7 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
         img_ent *ent = &g_mnt[mi].img->e[k];   // a damaged file is named once, at its first open
         if ((ent->flags & IMG_ENT_DAMAGED) && !(__atomic_fetch_or(&ent->flags, IMG_ENT_REPORTED, __ATOMIC_RELAXED) & IMG_ENT_REPORTED))
             LOG("[RED] fs %s failed the NCA's hash check when it was extracted (a damaged NSP, --allow-damaged); its bytes may be wrong", path);
+        if ((k = img_serve(&g_mnt[mi], k, path)) < 0) return RES_PATH_NOT_FOUND;
         *out = FH_OUT(IMG_HANDLE(mi, k));
         if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → image entry %lld", (now_ns() - g_t0_ns) / 1e9, path, mode, (long long)k);
         return RES_OK;
@@ -850,9 +919,8 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
-        long long where = IMG_H(h) ? (long long)(base + off) : (long long)off;   // an image entry reads at its own offset into the image: log where in the image, so fslog_paths.py names the file
-        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", where, got, buf, (unsigned long long)fh);
-        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", where, got, buf);
+        if (hash_on) fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\t%016llx\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf, (unsigned long long)fh);
+        else fprintf(g_fslog, "%.4f\t%s\t%lld\t%zu\t%p\n", (now_ns() - g_t0_ns) / 1e9, !IMG_H(h) && (int)h < 4096 && g_fdpath[(int)h] ? g_fdpath[(int)h] : "?", (long long)off, got, buf);
         pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) {   // Read metering: print a line every 64 MiB accumulated or every 1000 reads
         static uint64_t n, bytes, next_b = 64 << 20; static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
@@ -989,7 +1057,7 @@ HLE_FORCE("_ZN2nn2fs10RenameFileEPKcS2_", "fsp-srv → rename(2)", Result, h_fs_
 HLE_FORCE("_ZN2nn2fs15RenameDirectoryEPKcS2_", "fsp-srv → rename(2) of a directory", Result, h_fs_RenameDir, const char *from, const char *to) { dm_thread_service_request(); return rename_entry(from, to); }
 HLE_FORCE("_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", "fsp-srv → stat(2)", Result, h_fs_GetEntryType, int32_t *out, const char *path) { dm_thread_service_request();
     int mi; int64_t k;
-    if (img_path(path, &mi, &k)) { if (k < 0) return err_res("stat", path); *out = g_mnt[mi].img->e[k].type ? ENT_FILE : ENT_DIR; return RES_OK; }
+    if (img_path(path, &mi, &k)) { if (k < 0) return err_res("stat", path); if (img_serve(&g_mnt[mi], k, path) < 0) return RES_PATH_NOT_FOUND; *out = g_mnt[mi].img->e[k].type ? ENT_FILE : ENT_DIR; return RES_OK; }   // a damaged .zs without a substitute is "not found" here too (img_serve)
     HP(path); struct stat st;
     if (stat(hp, &st)) return err_res("stat", hp);
     *out = S_ISDIR(st.st_mode) ? ENT_DIR : ENT_FILE; return RES_OK;

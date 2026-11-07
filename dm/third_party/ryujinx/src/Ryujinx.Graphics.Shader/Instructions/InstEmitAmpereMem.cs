@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x3a9, InstName.Atom, AAtomgCas, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -47,8 +48,6 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0xf60, InstName.Tex, ATex, InstProps.Tex);
             x(0xf63, InstName.Tld4, ATex, InstProps.Tex);
             x(0xf6c, InstName.Txd, ATex, InstProps.Tex);
-            x(0xf69, InstName.Tmml, ATex, InstProps.Tex);
-            x(0x36a, InstName.Tmml, ATex, InstProps.Tex);
             x(0xb66, InstName.Tld, ATex, InstProps.Tex);
             x(0xb63, InstName.Tld4, ATex, InstProps.Tex);
             x(0xb69, InstName.Tmml, ATex, InstProps.Tex);
@@ -133,7 +132,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             if (stage != null)
             {
                 // A task or mesh shader's stage input (QueryAmpereStageMemory). Mode 0x78: its workgroup's number; 0x38: a word of the payload its task wrote, [Ra + offset];
-                // 0xb8: a word it wrote itself with 0x927's mode 0xb8 (Ocarina of Time's task shader 5d3a096025e375a1 reads its payload back in a later thread)
+                // 0xb8 (the payload store's mode, 0x927): a word of the payload this task writes, read back. The Legend of Zelda: Ocarina of Time's agl task shader
+                // 5d3a096025e375a1 stores a word at payload + 0x10 (+0x70) and reads it at +0x80
                 int mode = x.Bits(72, 80);
 
                 if (mode != 0x78 && mode != 0x38 && mode != 0xb8)
@@ -141,7 +141,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
                     throw AFail(context, $"ISBERD mode {mode:x2} in a task or mesh shader");
                 }
 
-                Operand addr = mode == 0x78 ? Const(stage[0]) : context.IAdd(AGpr(x.Ra), Const(stage[mode == 0xb8 ? 2 : 1] + (int)x.SignedField(40, 64)));
+                Operand addr = mode == 0x78 ? Const(stage[0]) : context.IAdd(AGpr(x.Ra), Const((mode == 0xb8 ? stage[2] : stage[1]) + (int)x.SignedField(40, 64)));
                 EmitLoad(context, StorageKind.SharedMemory, LsSize2.B32, addr, x.Rd, 0);
                 return;
             }
@@ -348,6 +348,32 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
                 context.Store(storageKind, lo, hi, value);
             }
+        }
+
+        // ATOMG.CAS Rd, [Ra + offset], Rb, Rc (0x3a9): the old word to Rd, the new one Rc (64..72) where the word equals Rb, Ra a pair with bit 72, size 73..76, and whether it swapped to the predicate
+        // at 81..84 (PT here). Ocarina of Time's foliage compute shaders (FoliageShader.sharcb) claim a hash slot with it, CAS(slot, 0, index + 1), and take the old value's index when it was taken
+        public static void AAtomgCas(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+            AtomSize size = (AtomSize)x.Bits(73, 76);
+
+            if (size is not (AtomSize.U32 or AtomSize.S32))
+            {
+                throw AFail(context, $"ATOMG.CAS size {size}");
+            }
+
+            if (x.Bit(91))
+            {
+                throw AFail(context, "ATOMG.CAS in the uniform form");
+            }
+
+            (Operand lo, Operand hi) = AGlobalAddress(context, x, 72, 64, 0);
+            Operand expected = context.Copy(x.Rb >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rb, RegisterType.Gpr));
+            Operand value = x.Rc >= RegisterConsts.RegisterZeroIndex ? Const(0) : Register(x.Rc, RegisterType.Gpr);
+            Operand old = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, lo, hi, expected, value);
+
+            ASetPred(context, x.Bits(81, 84), context.ICompareEqual(old, expected));
+            ASet(context, x, old);
         }
 
         // RED [Ra + UR + offset], Rb: type 73..76, operation 87..90
@@ -656,11 +682,10 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // 40..46. 0x361, 0x364 and 0x367 (TEX, TLD4 and TLD, bit 59 set): a register, the first of the second source block,
             // before the LOD (a census of Fire Emblem Fortune's Weave's 3,327: of the sources that an LDC just wrote, always that place, with and without .SCR). Rc stays the second destination in both
             Operand boundHandle = null;
-            // 0xf69 and 0x36a are TMML the same way (0xb69's other fields; Kirby Air Riders: 4,776 pixel shaders).
-            bool handleInB = opcode is 0x361 or 0x364 or 0x367 or 0x36a;
-            bool bindless = handleInB || opcode is 0xf60 or 0xf63 or 0xf6c or 0xf69;
+            bool handleInB = opcode is 0x361 or 0x364 or 0x367;
+            bool bindless = handleInB || opcode is 0xf60 or 0xf63 or 0xf6c;
 
-            if (opcode is 0xf60 or 0xf63 or 0xf6c or 0xf69)
+            if (opcode is 0xf60 or 0xf63 or 0xf6c)
             {
                 int ur = x.Bits(40, 46);
 
@@ -669,7 +694,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (bindless)
             {
-                opcode = opcode is 0xf63 or 0xf6c or 0xf69 ? opcode - 0x400 : opcode is 0x364 or 0x367 or 0x36a ? opcode + 0x7ff : 0xb60;
+                opcode = opcode is 0xf63 or 0xf6c ? opcode - 0x400 : opcode is 0x364 or 0x367 ? opcode + 0x7ff : 0xb60;
             }
 
             TexDim dim = ATexDim(context, x.Bits(61, 64));
@@ -942,7 +967,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
 
             if (opcode == 0xb69)
             {
-                ATmml(context, type, flags, handle, cbufSlot, mask, results, sources.ToArray(), bindless);
+                ATmml(context, type, flags, handle, cbufSlot, mask, results, sources.ToArray());
             }
             else
             {
@@ -961,9 +986,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
         }
 
         // TMML: the LOD a sample would use, x and y in 8.8 fixed point (as Maxwell's)
-        private static void ATmml(EmitterContext context, SamplerType type, TextureFlags flags, int handle, int cbufSlot, int mask, Operand[] results, Operand[] sources, bool bindless)
+        private static void ATmml(EmitterContext context, SamplerType type, TextureFlags flags, int handle, int cbufSlot, int mask, Operand[] results, Operand[] sources)
         {
-            SetBindingPair setAndBinding = bindless ? default : context.ResourceManager.GetTextureOrImageBinding(Instruction.Lod, type, TextureFormat.Unknown, flags, cbufSlot, handle);
+            SetBindingPair setAndBinding = context.ResourceManager.GetTextureOrImageBinding(Instruction.Lod, type, TextureFormat.Unknown, flags, cbufSlot, handle);
             int r = 0;
 
             for (int comp = 0; comp < 4; comp++)

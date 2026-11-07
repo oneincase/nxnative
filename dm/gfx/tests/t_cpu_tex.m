@@ -103,43 +103,70 @@ static void finalized_upload(int write_after_record) {
     CHECK(!tex_cpu_written(serial), "pool finalization drops retired CPU classification");
     defer_drain(); munmap(mem,len);
 }
-// nvnMemoryPoolFinalize on a game thread while the submit thread walks the texture IDs (pool_gpu, holding g_rmu): the finalize dropped the pool's CPU-written classification before it
-// marked the pool's IDs gone, so a walk in between found a live ID, a pool still set and a texture no longer CPU-written, and tex_mtl_ handed out its packaged entry (an NvPkg) as the
-// texture: "-[NvPkg buffer]: unrecognized selector" in tex_by_id (Ocarina of Time, reference/nvn-objects.md). Here the test holds g_rmu as the walk does while another thread finalizes
-static void *finalize_pool(void *pool) { h_nvnMemoryPoolFinalize((NVNmemoryPool *)pool); return NULL; }
-static void finalize_during_walk(void) {
-    const size_t len = 262144;
+static void finalized_bindless_pool(void) {
+    enum { N = NGHOST + 16, FIRST = 256, STRIDE = 4096 };
+    const size_t len = N * STRIDE;
     uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
     if (mem == MAP_FAILED) abort();
-    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
-    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "CPU-cached pool initialized");
-    NVNtextureBuilder tb; NVNtexture tex = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    NVNmemoryPool pool = {0};
+    pool_builder_t pb = {.mem = mem, .size = len, .flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize(&pool, (const NVNmemoryPoolBuilder *)&pb), "bindless texture storage initialized");
+    NVNtextureBuilder tb; h_nvnTextureBuilderSetDefaults(&tb);
     h_nvnTextureBuilderSetWidth(&tb, 4); h_nvnTextureBuilderSetHeight(&tb, 4); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
-    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
-    CHECK(h_nvnTextureInitialize(&tex, &tb), "texture initialized");
-    uint64_t serial = ((tex_t *)&tex)->serial;
-    uint8_t pixels[64]; for (int i=0;i<64;i++) pixels[i]=(uint8_t)(i+32);
-    NVNcopyRegion region = {0,0,0,4,4,1};
-    h_nvnTextureWriteTexels(&tex, NULL, &region, pixels);
-    mtl_reg_tex(1, (const tex_t *)&tex, NULL);
+    NVNcopyRegion region = {0, 0, 0, 4, 4, 1};
+    uint8_t pixels[64]; memset(pixels, 0x7e, sizeof pixels);
+    int initialized = 1;
+    for (int i = 0; i < N; i++) {
+        NVNtexture tex = {0};
+        h_nvnTextureBuilderSetStorage(&tb, &pool, (ptrdiff_t)i * STRIDE);
+        initialized &= h_nvnTextureInitialize(&tex, &tb);
+        h_nvnTextureWriteTexels(&tex, NULL, &region, pixels);
+        mtl_reg_tex(FIRST + i, (const tex_t *)&tex, NULL);
+        h_nvnTextureFinalize(&tex);
+    }
+    CHECK(initialized, "all retired descriptors have valid storage");
     mtl_sub_begin();
+    uint64_t uploads = g_pkg_uploads;
+    __unsafe_unretained id<MTLBuffer> a = nil, b = nil;
     os_unfair_lock_lock(&g_rmu);
-    id<MTLTexture> first = tex_by_id(1);
-    CHECK(first && first.width == 4, "the packaged texture resolves");
-    CHECK([tex_get(serial) isKindOfClass:[NvPkg class]], "its table entry is an NvPkg");
-    pthread_t th; pthread_create(&th, NULL, finalize_pool, &pool);
-    usleep(100000);   // the finalize runs as far as it can while the walk holds g_rmu
-    CHECK(tex_cpu_written(serial), "the pool's classification stays while a walk can still find its IDs live");
-    id again = tex_mtl((const tex_t *)&tex);
-    CHECK(again && ![again isKindOfClass:[NvPkg class]], "tex_mtl does not hand out the NvPkg during the finalize");
+    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &a);
+    uint64_t first = ((const uint64_t *)((const char *)a.contents + DMSH_POOL_HEAD))[FIRST];
+    CHECK(g_pkg_uploads == uploads + N && g_ghost_active.n == N, "one upload per retired descriptor in the first pool walk");
+    pool_gpu(0, MTLTextureType2D, NVN_DPF_FLOAT, 0, &b);
+    uint64_t again = ((const uint64_t *)((const char *)b.contents + DMSH_POOL_HEAD))[FIRST];
     os_unfair_lock_unlock(&g_rmu);
-    pthread_join(th, NULL);
-    CHECK(!tex_cpu_written(serial) && g_treg[1].gone, "after the finalize the ID is gone and the classification dropped");
-    os_unfair_lock_lock(&g_rmu); id after = tex_by_id(1); os_unfair_lock_unlock(&g_rmu);
-    CHECK(![after isKindOfClass:[NvPkg class]], "the gone ID does not hand out the NvPkg either");
-    CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "submission completed");
-    mtl_reg_tex(1,NULL,NULL); h_nvnTextureFinalize(&tex);
-    defer_drain(); munmap(mem,len);
+    CHECK(first == again && g_pkg_uploads == uploads + N, "rebuilding the pool preserves textures that spilled out of the ghost ring");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull) && !mtl_last_commit_error(), "bindless pool uploads completed");
+    CHECK(!g_ghost_active.n && g_ghost.n == NGHOST && !g_treg[FIRST].view, "submission drops its pins and transient views and keeps the bounded ghost cache");
+    for (int i = 0; i < N; i++) mtl_reg_tex(FIRST + i, NULL, NULL);
+    h_nvnMemoryPoolFinalize(&pool);
+    defer_drain(); munmap(mem, len);
+}
+// Pool table buffers (ptb_get / ptb_retire): a retired table is reused only after the GPU has completed its fence, only at the same length, stays resident while kept,
+// and past PTB_KEEP the oldest goes to the deferred release (Ocarina of Time's Kokiri Forest made 2-3 new 265 KB tables a frame, each added to and removed from the residency set)
+static int resident(id o) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:o]; pthread_mutex_unlock(&g_res_mu); return r; }
+static void ptb_recycle(void) {
+    uint64_t fence0 = atomic_load(&g_fence), done0 = atomic_load(&g_done), made0 = g_stat_ptb_made, reused0 = g_stat_ptb_reused;
+    atomic_store(&g_done, fence0);   // everything before is complete
+    id<MTLBuffer> a = ptb_get(4096);
+    CHECK(a && a.length == 4096 && resident(a) && g_stat_ptb_made == made0 + 1, "a new table buffer is made resident");
+    ptb_retire(a);
+    atomic_store(&g_fence, fence0 + 1);   // the submission that may read it is committed, not complete
+    id<MTLBuffer> b = ptb_get(4096);
+    CHECK(b && b != a && g_stat_ptb_reused == reused0, "a table the GPU may still read is not reused");
+    atomic_store(&g_done, fence0 + 1);
+    id<MTLBuffer> c = ptb_get(8192);
+    CHECK(c != a && c.length == 8192, "a retired table is not reused at another length");
+    id<MTLBuffer> d = ptb_get(4096);
+    CHECK(d == a && resident(d) && g_stat_ptb_reused == reused0 + 1, "once its fence completes the retired table is reused, still resident");
+    ptb_retire(b); ptb_retire(c); ptb_retire(d);
+    size_t deferred0; pthread_mutex_lock(&g_deferred_mu); deferred0 = g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+    int kept = g_nptb;
+    for (int i = 0; i < PTB_KEEP; i++) { id<MTLBuffer> e = [g_dev newBufferWithLength:1024 options:MTLResourceStorageModeShared]; res_add(e); ptb_retire(e); }
+    size_t deferred1; pthread_mutex_lock(&g_deferred_mu); deferred1 = g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
+    CHECK(g_nptb == PTB_KEEP && deferred1 == deferred0 + (size_t)kept, "past PTB_KEEP the oldest retired tables go to the deferred release");
+    while (g_nptb) { defer_obj_release(g_ptb[--g_nptb].b); g_ptb[g_nptb].b = nil; }
+    atomic_store(&g_fence, fence0); atomic_store(&g_done, done0);
 }
 int main(int argc, const char **argv) { @autoreleasepool {
     enum { N = 6442, BASE = 1000 };
@@ -165,16 +192,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     tex_t z = {0}; mtl_tex_cpu_written(&z);
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
-    // NVNtexture is plain data: finalizing a copy ends the copy. The texture stays live while the object it was initialized in holds it; if that object no longer does, the copy was the last one
-    static tex_t own, cpy, moved;
-    own.magic = MAGIC('T', 'E', 'X', 0); own.serial = 900001; own.d = t[0].d; mtl_tex_init(&own); mtl_tex_cpu_written(&own);
-    cpy = own; mtl_tex_release(&cpy);
-    CHECK(tex_cpu_written(own.serial) == 1, "finalizing a copy leaves the texture live");
-    mtl_tex_release(&own);
-    CHECK(!nvn_hm_get(&g_tex_live, &own.serial), "finalizing the object itself ends it");
-    own.serial = 900002; mtl_tex_init(&own); moved = own; own.magic = 0; mtl_tex_release(&moved);
-    CHECK(!nvn_hm_get(&g_tex_live, &moved.serial), "a copy outliving the object it was initialized in ends the texture");
     retired_classification(); descriptor_replacement();
-    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalize_during_walk(); }
+    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); ptb_recycle(); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

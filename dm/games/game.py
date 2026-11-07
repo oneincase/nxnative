@@ -102,7 +102,7 @@ def by_build(main_id):   # the profile whose build rows register this main build
 
 
 # agl's upscaler network (NDSR), by where the shader map found each key: the compute shaders of agl_ndsr.pck (Donkey Kong Bananza's 24 in its release library, Splatoon Raiders' 20 in its debug one)
-UPSCALER_SOURCE = re.compile(r'/agl_ndsr\.pck#')
+UPSCALER_SOURCE = re.compile(r'/agl_ndsr(_vr(_light)?)?\.pck#')   # Ocarina of Time's are the _vr / _vr_light packs
 
 
 def upscaler_keys(g):
@@ -185,14 +185,48 @@ def header_one(g):
     sf = g.get('shared_font', 'bfttf')   # what the shared-font address points at (hle_sdk16.c): bfttf = 8-byte header + TTF, ttf = the TTF alone
     if sf not in ('bfttf', 'ttf'): sys.exit(f'{g.id}: shared_font must be bfttf or ttf: {sf}')
     pl = g.get('pad_layout', 'simple')   # the virtual gamepad's first layout (DmGamepad.m; afterwards whatever the player switched to in game is kept): simple = 2D, full = 3D (D-pad, right stick, L3 / R3),
-    if pl not in ('simple', 'full', 'touch'): sys.exit(f'{g.id}: pad_layout must be simple, full or touch: {pl}')   # touch = Tap (no control: every touch goes to the game's touch screen)
+    if pl not in ('simple', 'full', 'touch', 'native'): sys.exit(f'{g.id}: pad_layout must be simple, full, touch or native: {pl}')   # touch = Tap (no control: every touch goes to the game's touch screen); native = a mobile-game layout in glass (a floating left stick, the camera on the right half, icon keys with the button's letter)
+    fwg = g.get('frame_wg', 'off')   # Deadline boost's default (hle_nvn.c fwg_get, the frame workgroup; DM_FRAME_WG and the launcher override): on keeps the frame's threads on the performance cores
+    if fwg not in ('off', 'on'): sys.exit(f'{g.id}: frame_wg must be off or on: {fwg}')
+    rsp = g.get('res_presets', 'off')   # the launcher's Resolution row (DM_RES_PRESET, hle_fs.c rom_overlay_set): on when the app's romfs_overlay has potato-<mode>/ folders beside <mode>/ (Ocarina of Time: 0.6 of the base)
+    if rsp not in ('off', 'on'): sys.exit(f'{g.id}: res_presets must be off or on: {rsp}')
+    pth = g.get('pad_theme', 'classic')   # the virtual gamepad's colours (DmGamepad.m theme_init; the launcher's Touch controls style, DM_PAD_THEME, overrides): classic = translucent white, forest = the N64-and-woods palette
+    if pth not in ('classic', 'forest'): sys.exit(f'{g.id}: pad_theme must be classic or forest: {pth}')
     sks = g.get('shader_key_skip', '')   # control-section bytes the shader keys hash as zeros, <offset>+<length> (hle_nvn.c keys_hash, shader_split.py key_ctl; Batman: Arkham Knight: GLSLC's compile information, 0x770+0x78)
     m = re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)\+(0x[0-9a-fA-F]+|\d+)', sks) if sks else None
     if sks and (not m or not 0x30 <= int(m[1], 0) or not 0 < int(m[2], 0) or int(m[1], 0) + int(m[2], 0) > 0x880 or (int(m[1], 0) < 0x760 and int(m[1], 0) + int(m[2], 0) > 0x700)):   # not over +0x700..+0x75f, the code area and compute fields the tools read
         sys.exit(f'{g.id}: shader_key_skip takes <offset>+<length> within the first 0x880 bytes of the control section, past its header (+0x30) and clear of +0x700..+0x75f: {sks}')
     sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
+    tsa = g.get('tex_soft_arrays', 'on')   # with tex_soft: whether 2D arrays are soft too (nvn_mtl.m tex_soft): on / off
+    if tsa not in ('on', 'off'): sys.exit(f'{g.id}: tex_soft_arrays must be on or off: {tsa}')
+    tsl = g.get('tex_soft_levels', '1')   # with tex_soft: how many finest levels a soft texture leaves out, 1 to 3 (nvn_mtl.m tex_soft_n)
+    if tsl not in ('1', '2', '3'): sys.exit(f'{g.id}: tex_soft_levels must be 1, 2 or 3: {tsl}')
+    tsf = g.get('tex_soft', 'off')   # large block-compressed packaged textures kept without their finest level (nvn_mtl.m tex_soft): on / off
+    if tsf not in ('on', 'off'): sys.exit(f'{g.id}: tex_soft must be on or off: {tsf}')
+    gmb = g.get('gmem_nobig', 'off')   # large pools in the raw global memory table by their resident chunks only (nvn_mtl.m gmem_nobig_on): on / off
+    if gmb not in ('on', 'off'): sys.exit(f'{g.id}: gmem_nobig must be on or off: {gmb}')
+    rtl = g.get('rt_lossy', 'off')   # colour render targets the GPU writes only as attachments made with Metal's lossy compression (about half the memory and bandwidth; nvn_mtl.m rt_lossy): on / off
+    if rtl not in ('on', 'off'): sys.exit(f'{g.id}: rt_lossy must be on or off: {rtl}')
+    upc = g.get('upscaler_chain', '')   # <stage>,<stage>...><last>: an upscaler that is a chain of shaders (16-digit keys); with DM_UPSCALER=metalfx the stages before the last are skipped and MetalFX scales the first stage's input into the last's image (nvn_mtl.m up_chain)
+    if upc and not re.fullmatch(r'[0-9a-f]{16}(,[0-9a-f]{16})*>[0-9a-f]{16}(\|[0-9a-f]{16})*', upc): sys.exit(f'{g.id}: upscaler_chain takes <key>,<key>...><key>[|<key>...] (the last stage, or any of several): {upc}')
+    fcp = g.get('fps_cap_present', 'off')   # fps_target / the player's frame rate held by presentation alone (hle_nvn.c fps_present_cap), for a game whose logic follows real time: on / off
+    if fcp not in ('on', 'off'): sys.exit(f'{g.id}: fps_cap_present must be on or off: {fcp}')
+    rtd = g.get('rt_drop', 'off')   # render targets whose storage a later-drawn render target took over, and idle since, kept as 1x1 stand-ins until drawn again (nvn_mtl.m rtd_sweep): on / off
+    if rtd not in ('on', 'off'): sys.exit(f'{g.id}: rt_drop must be on or off: {rtd}')
+    rta = g.get('rt_alias', 'off')   # GPU-only textures in a pool the CPU cannot access placed in heaps over the pool, so textures over the same storage share memory as on the console (nvn_mtl.m pool_heap_texture): on / off
+    if rta not in ('on', 'off'): sys.exit(f'{g.id}: rt_alias must be on or off: {rta}')
+    gms = g.get('gmem_skip', 'off')   # compressible, shader code and GPU no-access pools out of the raw global memory pool table (nvn_mtl.m mtl_pool_noraw): on / off
+    if gms not in ('on', 'off'): sys.exit(f'{g.id}: gmem_skip must be on or off: {gms}')
+    gml = g.get('gmem_lazy', 'off')   # the raw global memory pool table lists resident pools only (nvn_mtl.m gmem_lazy): on / off
+    if gml not in ('on', 'off'): sys.exit(f'{g.id}: gmem_lazy must be on or off: {gml}')
     rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
     if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
+    trl = g.get('tex_release', 'off')   # guest copies of uploaded textures given back once on the GPU (nvn_mtl.m rel_mode; DM_TEX_RELEASE overrides): 1 = CPU_NO_ACCESS pools, 2 = also CPU-visible ones
+    if trl not in ('off', '1', '2'): sys.exit(f'{g.id}: tex_release must be off, 1 or 2: {trl}')
+    psr = g.get('pool_skip_retired', 'off')   # pool tables give a retired texture ID without a view the dummy instead of a texture made again (nvn_mtl.m pool_gpu; DM_NVN_POOL_SKIP_RETIRED overrides): on / off
+    if psr not in ('on', 'off'): sys.exit(f'{g.id}: pool_skip_retired must be on or off: {psr}')
+    dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
+    if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
     if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
     tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
@@ -208,6 +242,8 @@ def header_one(g):
     if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
     if gts not in ('submission', 'segment'): sys.exit(f'{g.id}: gpu_timestamps must be submission or segment: {gts}')
+    rsub = ' '.join(g.get('romfs_substitute', '').split())   # damaged RomFS files (a .zs that is not a zstd stream) served as another image file (hle_fs.c img_serve; DM_ROMFS_SUBST overrides): <path>=<substitute path> ...
+    if any(w.count('=') != 1 or w.startswith(('=', '/')) or w.endswith('=') or '=/' in w for w in rsub.split()): sys.exit(f'{g.id}: romfs_substitute takes <path>=<substitute path> pairs, RomFS paths without a leading /: {rsub}')
     om = g.get('op_mode', 'console')   # the operation mode reported at start (hle_oe.c dm_opmode; DM_OPMODE overrides): console = docked, handheld = touch screen in use (Super Mario Galaxy's pointer)
     if om not in ('console', 'handheld'): sys.exit(f'{g.id}: op_mode must be console or handheld: {om}')
     if pl == 'touch' and om != 'handheld': sys.exit(f'{g.id}: pad_layout touch needs op_mode handheld (the touch screen reaches the game only in handheld mode)')
@@ -253,18 +289,36 @@ def header_one(g):
          f'#define DM_GAME_PSO_MTL4 {int(p4 == "on")}',
          f'#define DM_GAME_ENC_THREAD {int(et == "on")}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}'] if g.get('shared_font', '') else []),   # without the key the host decides by the SDK version (hle_sdk16.c)
-         f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch").index(pl)}',
+         f'#define DM_GAME_PAD_LAYOUT {("simple", "full", "touch", "native").index(pl)}',
+         f'#define DM_GAME_PAD_THEME {("classic", "forest").index(pth)}',
+         f'#define DM_GAME_RES_PRESETS {int(rsp == "on")}',
+         f'#define DM_GAME_FRAME_WG {int(fwg == "on")}',
          f'#define DM_GAME_OPMODE {int(om == "console")}',
          f'#define DM_GAME_PERF_BOOST {int(pm == "boost")}',
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {int(tfu == "on")}',
          f'#define DM_GAME_SHADER_KEY_SKIP_OFF {sko:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {skl:#x}',
          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
+         f'#define DM_GAME_GMEM_LAZY {int(gml == "on")}',
+         f'#define DM_GAME_GMEM_SKIP {int(gms == "on")}',
+         f'#define DM_GAME_GMEM_NOBIG {int(gmb == "on")}',
+         f'#define DM_GAME_TEX_SOFT {int(tsf == "on")}',
+         f'#define DM_GAME_TEX_SOFT_LEVELS {int(tsl)}',
+         f'#define DM_GAME_TEX_SOFT_ARRAYS {int(tsa == "on")}',
+         f'#define DM_GAME_RT_ALIAS {int(rta == "on")}',
+         f'#define DM_GAME_RT_DROP {int(rtd == "on")}',
+         f'#define DM_GAME_FPS_CAP_PRESENT {int(fcp == "on")}',
+         f'#define DM_GAME_UPSCALER_CHAIN "{upc}"',
+         f'#define DM_GAME_RT_LOSSY {int(rtl == "on")}',
+         f'#define DM_GAME_POOL_SKIP_RETIRED {int(psr == "on")}',
+         f'#define DM_GAME_TEX_RELEASE {0 if trl == "off" else int(trl)}',
+         f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',
          f'#define DM_GAME_DRAW_BARRIERS_GAME {int(dbr == "game")}',
          f'#define DM_GAME_UPSCALER_KEYS {q(",".join(ups))}', f'#define DM_GAME_UPSCALER_N {len(ups)}',
          f'#define DM_GAME_VCONV_RANGE {int(vcr == "on")}',
+         f'#define DM_GAME_ROMFS_SUBST {q(rsub)}',
          *([f'#define DM_GAME_NVN_API_MAJOR {api.split(".")[0]}', f'#define DM_GAME_NVN_API_MINOR {api.split(".")[1]}'] if g.get('device_api', '') else []),   # without the key: by the SDK version (hle_nvn.c nvn_api)
          '']
     return '\n'.join(L)

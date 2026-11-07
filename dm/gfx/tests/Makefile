@@ -53,6 +53,8 @@ t_nvn: t_nvn.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c $(G
 	clang $(CFLAGS) -fobjc-arc -o $@ t_nvn.c ../../host/crash.c ../../host/hle_bigstack.c $(GFX) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
+t_dirty_discard: t_dirty_discard.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_discard.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
 t_dirty_retire_race: t_dirty_retire_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -119,6 +121,14 @@ t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+t_deferred_release: t_deferred_release.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_deferred_release.m $(MTL_T_SRC) $(FW)
+t_mesh_indirect: t_mesh_indirect.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mesh_indirect.m $(MTL_T_SRC) $(FW)
+# The game's dispatches side by side in the copy encoder where no barrier of its and nothing else lies between them (dispatch_enc, DM_NVN_DISPATCH_OVERLAP)
+t_dispatch_overlap: t_dispatch_overlap.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_dispatch_overlap.m $(MTL_T_SRC) $(FW)
+check_t_dispatch_overlap: RUN_ENV = MTL_DEBUG_LAYER=1
 .PHONY: check_t_cpu_tex
 check_t_cpu_tex: t_cpu_tex
 	MTL_DEBUG_LAYER=1 ./t_cpu_tex --metal
@@ -133,6 +143,10 @@ check_t_capture: t_capture
 # On the GPU: two synthetic frames through the capture hooks, the second one captured, then replayed by nvn_replay (same digest, twice)
 t_large_mdi: t_large_mdi.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_large_mdi.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+# Indirect draws converted ahead past a uniform update that writes none of their records: the pass is not split; an update of a record still converts after it
+t_ixc_ahead: t_ixc_ahead.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ixc_ahead.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+check_t_ixc_ahead: RUN_ENV = MTL_DEBUG_LAYER=1
 t_capture_live: t_capture_live.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_capture_live.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_capture_live
@@ -158,8 +172,21 @@ t_tex_fit_root: t_tex_fit_root.m $(MTL_T_DEP)
 .PHONY: check_t_tex_fit_root
 check_t_tex_fit_root: t_tex_fit_root
 	MTL_DEBUG_LAYER=1 ./t_tex_fit_root
+t_pool_retired: t_pool_retired.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_retired.m $(MTL_T_SRC) $(FW)
+check_t_pool_retired: RUN_ENV = MTL_DEBUG_LAYER=1
+t_pool_holds: t_pool_holds.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_holds.m $(MTL_T_SRC) $(FW)
 t_pool_chunks: t_pool_chunks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_chunks.m $(MTL_T_SRC) $(FW)
+# Raw global memory on the GPU through the host's pool table (t_gmem_raw.m), with the shader test_dmsh_ampere_mem.py translates (DMSH_TEST_XLATE, default the in-repo translator);
+# skipped only when the translator does not run (its exit code 77)
+t_gmem_raw: t_gmem_raw.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_raw.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_gmem_raw
+check_t_gmem_raw: t_gmem_raw
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; rc=0; DMSH_TEST_XLATE=$${DMSH_TEST_XLATE:-$(CURDIR)/../tools/dmsh_xlate_bin/dmsh_xlate} python3 test_dmsh_ampere_mem.py --fixture "$$work" || rc=$$?; \
+	if [ $$rc = 77 ]; then echo "t_gmem_raw: skipped, the translator does not run"; elif [ $$rc != 0 ]; then exit $$rc; else MTL_DEBUG_LAYER=1 ./t_gmem_raw "$$work/raw.metallib"; fi
 t_sparse_tiles: t_sparse_tiles.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_sparse_tiles.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 t_readback: t_readback.m $(MTL_T_DEP)
@@ -224,6 +251,9 @@ check_t_queue_origin: t_queue_origin
 	MTL_DEBUG_LAYER=1 ./t_queue_origin
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_queue_origin
 check_t_rast_discard: RUN_ENV = MTL_DEBUG_LAYER=1
+t_gmem_marks: t_gmem_marks.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_gmem_marks.m $(MTL_T_SRC) $(FW)
+check_t_gmem_marks: RUN_ENV = MTL_DEBUG_LAYER=1
 t_cpu_storage: t_cpu_storage.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_storage.m $(MTL_T_SRC) $(FW)
 check_t_cpu_storage: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -241,6 +271,8 @@ t_sbw: t_sbw.m $(MTL_T_DEP)
 .PHONY: check_t_sbw
 check_t_sbw: t_sbw
 	./t_sbw
+t_ubdc: t_ubdc.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ubdc.m $(MTL_T_SRC) $(FW)
 t_ubp_running: t_ubp_running.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_ubp_running.m $(MTL_T_SRC) $(FW)
 .PHONY: check_t_ubp_running
@@ -419,6 +451,13 @@ t_srgb_alias: t_srgb_alias.m $(MTL_T_DEP)
 check_t_srgb_alias: RUN_ENV = MTL_DEBUG_LAYER=1
 t_image_alias: t_image_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_image_alias.m $(MTL_T_SRC) $(FW)
+t_alias_retire: t_alias_retire.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_alias_retire.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_alias_retire
+check_t_alias_retire: t_alias_retire
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_alias_retire
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_alias_retire
+	MTL_DEBUG_LAYER=1 ./t_alias_retire off
 .PHONY: check_t_image_alias
 check_t_image_alias: t_image_alias
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_image_alias

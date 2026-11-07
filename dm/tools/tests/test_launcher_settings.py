@@ -15,7 +15,7 @@ settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
 BOTW, WONDER = '01007EF00011E000', '010015100B514000'
-PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
+PERFORMANCE_NVN = ['DM_FRAME_WG', 'DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
 def build(gid, api, platform=None):
@@ -72,10 +72,11 @@ class LauncherSettingsTests(unittest.TestCase):
         s = build(BOTW, 'nvn')['DM_SHOW_FPS']
         self.assertEqual((s['on'], s['off']), ('1', '0'))
 
-    def test_iphone_switches_only_on_the_iphone(self):   # the frame-rate counter and touch feedback are the iOS front end's (front_ios.m, DmGamepad.m)
+    def test_iphone_switches_only_on_the_iphone(self):   # touch feedback and the picture fit are the iOS front end's (DmGamepad.m, front_ios.m); the frame-rate counter is both's (front_mac.m too)
         ios, mac = build(BOTW, 'nvn'), build(BOTW, 'nvn', 'mac')
         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
-        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT'})
+        self.assertEqual(set(ios) - set(mac), {'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT', 'DM_PAD_THEME'})
+        self.assertIn('DM_SHOW_FPS', mac)
         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
         self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN'})   # the Mac window's Display mode (front_mac.m reads 1 or 0)
         s = mac['DM_FULLSCREEN']

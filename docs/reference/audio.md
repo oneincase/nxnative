@@ -325,6 +325,10 @@ For a replaced DSP renderer the size query keeps the service's work-buffer contr
 - **Cause:** the game lists the virtual input devices when its audio starts (`main+0xf48124`) and opens the first with `audio::OpenInputStream` if there is one. The list goes through a service the host does not serve.
 - **Fix:** `ListVirtualInputDevices` reports none (`hle_audio.c` `h_is_List`), and the game skips its input stream.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (SDK 22.2.8); Star Fox imports the same calls.
+- **Symptom:** at boot, `[RED] sf: the game connects to service auddmg:u itself, which the host does not serve`, then `game called nn::diag abort: Result 0xa99` in the sdk (`nn::audio::detail::ListVirtualInputDevices`).
+- **Cause:** SDK 22's virtual input devices (the Switch 2's microphone routing) are listed through the `auddmg:u` service, which the SDK's own client connects to ([services the game connects to itself](../../dm/host/hle_sf.c)). `nn::audio::ListVirtualInputDevices` had no hook, so the SDK's code ran and aborted on the refused connection.
+- **Fix:** `hle_audio.c` answers `ListVirtualInputDevices` with no devices, as `ListAudioIns` ([above](#no-audio-input-devices)): the host has no microphone. The answer is the SDK 21 input streams' hook (`h_is_List`, made for Star Fox); a second hook of the same function stopped the host at load (`FATAL duplicate entry in the forced takeover list`).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), which lists them at boot.
 
 ### `OpenAudioOut` without a release event (SDK 22)
 

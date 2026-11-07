@@ -133,7 +133,9 @@ static int guest_file_class(int fd, char *why, size_t nwhy) {
 }
 #endif
 // The block in files of chunk bytes, the last one holding the rest: 1 with the files in g_gf_tab and mapped; 0 with why filled in, every file closed and the whole block anonymous PROT_NONE again, as reserved
+static size_t g_gf_chunk;   // each guest file's size (the last one holds the rest): an address's file is (a - g_as) / g_gf_chunk (pool_anon)
 static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *fs, char *why, size_t nwhy) {
+    g_gf_chunk = chunk;
     const double G = 1073741824.0; char path[1100]; int made = 0, ok = 1;
     const char *sep = dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/";
     for (int k = 0; ok && k < n; k++) {
@@ -355,8 +357,111 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // With the guest in files (DM_GUEST_FILE), an anonymous mapping over the range would turn it into anonymous memory, which phys_footprint charges again as soon as the game maps
 // it back, so the files' range only goes PROT_NONE: its pages stay file pages, out of the footprint, which the kernel writes out when it needs the room;
 // they keep their old bytes, so the call returns 0 and alias_initialize zeroes them when they are mapped again
+// Memory pools out of the guest files (DM_GUEST_FILE; DM_POOL_ANON=0 keeps them in): a pool's pages go back to anonymous memory when the game makes the pool (nvnMemoryPoolInitialize,
+// before the graphics layer wraps it in a zero-copy buffer or tracks its writes). Metal wires a zero-copy buffer's pages while it is resident, and the raw global memory table makes
+// every pool resident: The Legend of Zelda: Ocarina of Time (Switch 2) with its pools over file pages stalled up to a second a frame on pages coming back, and one run ended in a
+// GPU-driver kernel panic (IOGPUGroupMemory.cpp:286) on a 16 GB Mac. The rest of guest memory (heaps, the CPU's data) stays in the files, out of the footprint. The move: the range goes
+// read-only, a guest write faults and waits in pa_fault and a host write in pa_prep; the pages that hold data (resident or allocated in the file) and are not all zero are copied into a
+// fresh anonymous mapping beside, which vm_remap then puts in place; the rest stays lazy zeros. A virtual pool's mappings (hle_nvn.c MapVirtual, vm_remap of a physical pool's pages)
+// come after its physical pool's Initialize, so they share the anonymous pages. guest_release maps the files back over anonymous parts it gives back
+enum { ANON_MAX = 8192 };
+static struct { uintptr_t lo, hi; } g_anon[ANON_MAX]; static int g_nanon; static pthread_mutex_t g_anon_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_anon_bytes, g_anon_copied;
+static _Atomic uintptr_t g_pa_lo, g_pa_hi, g_pa_prev_lo, g_pa_prev_hi; static _Atomic uint64_t g_pa_prev_ns;
+static int pa_fault(void *addr, int is_write, void *uc) {
+    (void)uc; uintptr_t a = (uintptr_t)addr, lo = atomic_load(&g_pa_lo), hi = atomic_load(&g_pa_hi);
+    if (!is_write) return 0;
+    if (lo && a >= lo && a < hi) { while (atomic_load(&g_pa_lo) == lo) sched_yield(); return 1; }   // re-executed on the new mapping
+    uintptr_t plo = atomic_load(&g_pa_prev_lo), phi = atomic_load(&g_pa_prev_hi);   // the window closed between the fault and this look: the page is writable again
+    return plo && a >= plo && a < phi && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - atomic_load(&g_pa_prev_ns) < 200000000ull;
+}
+static void pa_prep(void *addr, size_t len) {
+    uintptr_t a = (uintptr_t)addr, lo = atomic_load(&g_pa_lo), hi = atomic_load(&g_pa_hi);
+    if (lo && a < hi && a + len > lo) while (atomic_load(&g_pa_lo) == lo) sched_yield();
+}
+static int pa_zero(uintptr_t a, size_t n) { const uint64_t *w = (const uint64_t *)a; for (size_t k = 0; k < n / 8; k++) if (w[k]) return 0; return 1; }
+static int anon_has(uintptr_t a) { for (int i = 0; i < g_nanon; i++) if (a >= g_anon[i].lo && a < g_anon[i].hi) return 1; return 0; }   // under g_anon_mu
+static void anon_move(uintptr_t lo, uintptr_t hi) {   // [lo, hi) to anonymous memory; under g_anon_mu
+    size_t pg = (size_t)getpagesize(), n = (hi - lo) / pg;
+    static int hooked; if (!hooked) { hooked = 1; dm_fault_hook_register(pa_fault); dm_guest_write_prep_register(pa_prep); }
+    void *tmp = mmap(NULL, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (tmp == MAP_FAILED) { LOG("[RED] memory pool %#lx+%#lx: no anonymous mapping (errno %d): it stays in the guest files", (unsigned long)lo, (unsigned long)(hi - lo), errno); return; }
+    char *v = malloc(n); if (!v) die("anon_move mincore vector");
+    atomic_store(&g_pa_hi, hi); atomic_store(&g_pa_lo, lo);
+    if (mprotect((void *)lo, hi - lo, PROT_READ)) { atomic_store(&g_pa_lo, 0); munmap(tmp, hi - lo); free(v); LOG("[RED] memory pool %#lx+%#lx: not readable (errno %d): it stays in the guest files", (unsigned long)lo, (unsigned long)(hi - lo), errno); return; }
+    if (mincore((void *)lo, hi - lo, v)) memset(v, 1, n);   // unknown: look at every page
+    for (uintptr_t c = lo; c < hi; ) {   // the pages allocated in the files (written, maybe paged out) may hold data too
+        size_t k = (size_t)(c - (uintptr_t)g_as) / g_gf_chunk; if ((int)k >= g_gf_n) k = (size_t)g_gf_n - 1;
+        uintptr_t fbase = (uintptr_t)g_as + k * g_gf_chunk, fend = k == (size_t)g_gf_n - 1 ? (uintptr_t)g_as + g_reserve : fbase + g_gf_chunk, ce = hi < fend ? hi : fend;
+        int fd = g_gf_tab[k]; off_t fo = (off_t)(c - fbase), fe = (off_t)(ce - fbase);
+        for (off_t d = lseek(fd, fo, SEEK_DATA); d >= 0 && d < fe; ) {
+            off_t h = lseek(fd, d, SEEK_HOLE); if (h < 0 || h > fe) h = fe;
+            for (off_t q = d & ~(off_t)(pg - 1); q < h; q += (off_t)pg) v[(fbase + (uintptr_t)q - lo) / pg] |= 1;
+            d = h < fe ? lseek(fd, h, SEEK_DATA) : -1;
+        }
+        c = ce;
+    }
+    uint64_t copied = 0;
+    for (size_t i = 0; i < n; i++) if ((v[i] & 1) && !pa_zero(lo + i * pg, pg)) { memcpy((char *)tmp + i * pg, (char *)lo + i * pg, pg); copied += pg; }
+    vm_address_t to = lo; vm_prot_t cur, max;
+    kern_return_t kr = vm_remap(mach_task_self(), &to, hi - lo, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (vm_address_t)tmp, FALSE, &cur, &max, VM_INHERIT_NONE);
+    if (kr != KERN_SUCCESS) mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE);
+    atomic_store(&g_pa_prev_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); atomic_store(&g_pa_prev_hi, hi); atomic_store(&g_pa_prev_lo, lo);   // before the window closes (pa_fault)
+    atomic_store(&g_pa_lo, 0);
+    munmap(tmp, hi - lo); free(v);
+    if (kr != KERN_SUCCESS) { LOG("[RED] memory pool %#lx+%#lx: vm_remap %d: it stays in the guest files", (unsigned long)lo, (unsigned long)(hi - lo), kr); return; }
+    if (g_nanon < ANON_MAX) { g_anon[g_nanon].lo = lo; g_anon[g_nanon].hi = hi; g_nanon++; } else { static int said; if (!said++) LOG("[RED] memory pools out of the guest files: more than %d ranges, later ones are not mapped back when released", ANON_MAX); }
+    uint64_t tot = atomic_fetch_add(&g_anon_bytes, hi - lo) + (hi - lo), cp = atomic_fetch_add(&g_anon_copied, copied) + copied;
+    static int lines; if (lines++ < 6 || (hi - lo) >= (256u << 20)) LOG("[mem] memory pool %#lx+%llu MB out of the guest files into anonymous memory (%llu MB copied; %llu MB of pools so far, %llu MB copied)", (unsigned long)lo,
+        (unsigned long long)((hi - lo) >> 20), (unsigned long long)(copied >> 20), (unsigned long long)(tot >> 20), (unsigned long long)(cp >> 20));
+}
+void dm_guest_pool_anon(void *mem, size_t size) {
+    if (!g_gf_n || !mem || !size) return;
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_POOL_ANON"); on = !e || !*e || atoi(e); if (!on) LOG("[mem] memory pools stay in the guest files (DM_POOL_ANON=0)"); }
+    if (!on) return;
+    size_t pg = (size_t)getpagesize(); uintptr_t lo = (uintptr_t)mem & ~(pg - 1), hi = ((uintptr_t)mem + size + pg - 1) & ~(pg - 1);
+    if (lo < (uintptr_t)g_as || hi > (uintptr_t)g_as + g_reserve) return;   // not guest memory
+    pthread_mutex_lock(&g_anon_mu);
+    for (uintptr_t a = lo; a < hi; ) {   // the parts not anonymous already (a live pool's pages are, and must not be moved under its buffer)
+        while (a < hi && anon_has(a)) a += pg;
+        uintptr_t b = a; while (b < hi && !anon_has(b)) b += pg;
+        if (a < b) anon_move(a, b);
+        a = b;
+    }
+    pthread_mutex_unlock(&g_anon_mu);
+}
+static void anon_release(uintptr_t lo, uintptr_t hi) {   // the guest files mapped back over the anonymous parts of [lo, hi), PROT_NONE, which leave the table
+    pthread_mutex_lock(&g_anon_mu);
+    for (int i = 0; i < g_nanon; i++) {
+        uintptr_t a = g_anon[i].lo > lo ? g_anon[i].lo : lo, b = g_anon[i].hi < hi ? g_anon[i].hi : hi;
+        if (a >= b) continue;
+        for (uintptr_t c = a; c < b; ) {   // file by file
+            size_t k = (size_t)(c - (uintptr_t)g_as) / g_gf_chunk; if ((int)k >= g_gf_n) k = (size_t)g_gf_n - 1;
+            uintptr_t fbase = (uintptr_t)g_as + k * g_gf_chunk, fend = k == (size_t)g_gf_n - 1 ? (uintptr_t)g_as + g_reserve : fbase + g_gf_chunk, ce = b < fend ? b : fend;
+            if (mmap((void *)c, ce - c, PROT_NONE, MAP_SHARED | MAP_FIXED, g_gf_tab[k], (off_t)(c - fbase)) == MAP_FAILED) LOG("[RED] guest memory %#lx+%#lx: its guest file not mapped back (errno %d)", (unsigned long)c, (unsigned long)(ce - c), errno);
+            c = ce;
+        }
+        atomic_fetch_sub(&g_anon_bytes, b - a);
+        uintptr_t olo = g_anon[i].lo, ohi = g_anon[i].hi;
+        if (olo < a && ohi > b && g_nanon < ANON_MAX) { g_anon[g_nanon].lo = b; g_anon[g_nanon].hi = ohi; g_nanon++; g_anon[i].hi = a; }   // split: both ends stay anonymous
+        else if (olo < a) g_anon[i].hi = a;
+        else if (ohi > b) g_anon[i].lo = b;
+        else { g_anon[i] = g_anon[--g_nanon]; i--; }
+    }
+    pthread_mutex_unlock(&g_anon_mu);
+}
+int dm_guest_in_files(void) { return g_gf_n != 0; }
+int dm_guest_range_in_files(const void *mem, size_t size) {   // nvn_dirty_discard: guest memory in files and [mem, mem+size) not wholly in an anonymous pool range (dm_guest_pool_anon)
+    if (!g_gf_n) return 0;
+    uintptr_t lo = (uintptr_t)mem, hi = lo + size; int in_anon = 0;
+    pthread_mutex_lock(&g_anon_mu);
+    for (int i = 0; i < g_nanon && !in_anon; i++) in_anon = lo >= g_anon[i].lo && hi <= g_anon[i].hi;
+    pthread_mutex_unlock(&g_anon_mu);
+    return !in_anon;
+}   // nvn_dirty_discard: an anonymous mapping over the files' range would undo them
 static int guest_release(uintptr_t lo, uintptr_t hi) {
     if (g_gf_n) {
+        anon_release(lo, hi);   // a pool's anonymous pages (dm_guest_pool_anon) go, its files' are back
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         return 0;
     }
