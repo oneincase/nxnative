@@ -12949,7 +12949,25 @@ void mtl_exec(const uint8_t *p) {
 static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
 static id<MTLSamplerState> g_blit_samp;
 static uint64_t g_present_n;
-uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
+uint64_t mtl_present_count(void) { return g_present_n; }
+
+// The fps overlay's data (front_mac.m fps_show): the longest present-to-present gap and the mean GPU time of the frames completed in the last second. The submit thread records the frame's GPU span at the frame summary (g_fs_last_*); a second with no completed frame reads -1 (no GPU reading)
+static _Atomic double g_fs_last_gpu = -1;
+void mtl_frame_stats(double *gap_max_ms, double *gpu_ms) {
+    static _Atomic uint64_t last_t; static _Atomic double gap_max;
+    uint64_t now = mach_absolute_time();
+    uint64_t prev = atomic_exchange(&last_t, now);
+    static dispatch_once_t once; dispatch_once(&once, ^{ atomic_store(&last_t, now); });
+    if (prev) {
+        static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+        double ms = (double)(now - prev) * tb.numer / tb.denom / 1e6;
+        double g = atomic_load(&gap_max);
+        atomic_store(&gap_max, ms > g ? ms : g);
+    }
+    *gap_max_ms = atomic_load(&gap_max);
+    *gpu_ms = atomic_exchange(&g_fs_last_gpu, -1);   // read once a second: the overlay takes what the last completed frame measured
+}
+void mtl_frame_gpu_note(double gpu_ms) { atomic_store(&g_fs_last_gpu, gpu_ms); }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
 void mtl_res_snapshot(mtl_res_count *out) {
     memset(out, 0, sizeof *out);
     out->pso = g_pso.n;
