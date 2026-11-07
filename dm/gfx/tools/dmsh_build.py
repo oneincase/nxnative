@@ -251,6 +251,67 @@ def tg_spill(msl):
 # the compiler takes it anyway: the gathers then read texels at offsets that differ between lanes and between runs, with no error. agl's NDSR upscaler builds its input tile this way, so
 # some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out
 GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
+# textureGatherOffsets whose offsets the translator could not fold to constants reaches the MSL as a plain gather
+# with a computed int2 offset (spirv-cross's own output of OpImageGather with a register offset; the constant-array
+# form above is gather_offsets). The offsets are per lane (the agl NDSR networks pack four 6-bit tile offsets per
+# word and extract them at the call), Metal's gather needs a quad-uniform offset, and the lanes then read texels at
+# offsets that differ between lanes and runs: The Legend of Zelda: Ocarina of Time's NDSR network drew that as dotted
+# horizontal rows over the walked states (d17eefaff4f0bc23 of agl_ndsr_vr.pck, 32 sites). A gather's .w is the
+# bilinear footprint's origin texel, floor(uv*size + off - 0.5) per component c, so the exact emulation is one texel
+# read; the sites' sampler wraps to the transparent-black border (wrap 5, border 0,0,0,0), which a read reproduces
+# with the range check. Sites with constant offsets stay gathers (quad-uniform, well defined).
+GATHER_RT = re.compile(r'spvDescriptorSet0\.(\w+)\.gather\(spvDescriptorSet0\.(\w+), ')
+GATHER_RT_OFF = re.compile(r'int2\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)')
+GATHER_RT_H = """static inline __attribute__((always_inline)) float dm_gather_rt(texture2d<float> t, sampler s, float2 uv, int2 off, component c)
+{
+    // A gather whose offset is computed per lane (tile data): Metal's gather needs a quad-uniform offset, so the
+    // four texels go through explicit reads. A comp::c gather's .w is the bilinear footprint's origin texel,
+    // floor(uv*size + off - 0.5); this sampler clamps to the transparent-black border (wrap 5, border 0,0,0,0).
+    int2 i = int2(floor(uv * float2(t.get_width(), t.get_height()) + float2(off) - 0.5));
+    if (i.x < 0 || i.y < 0 || i.x >= t.get_width() || i.y >= t.get_height()) return 0.0;
+    return c == component::x ? t.read(uint2(i), 0).x : c == component::y ? t.read(uint2(i), 0).y : c == component::z ? t.read(uint2(i), 0).z : t.read(uint2(i), 0).w;
+}
+"""
+def gather_rt_reads(msl):
+    out, i, n = [], 0, 0
+    while True:
+        m = GATHER_RT.search(msl, i)
+        if not m:
+            out.append(msl[i:])
+            break
+        depth, args, cur, j = 1, [], '', m.end()   # the argument list's first character is m.end()
+        while depth:
+            ch = msl[j]
+            j += 1
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            if ch == ',' and depth == 1:
+                args.append(cur.strip())
+                cur = ''
+            else:
+                cur += ch
+        args.append(cur.strip())
+        tail = j + 1
+        suffix = re.match(r'\.(w)', msl[tail:tail + 2])
+        if len(args) != 3 or GATHER_RT_OFF.fullmatch(args[1]):
+            out.append(msl[i:m.end()])
+            i = m.end()   # a constant offset (or another form): keep the gather
+            continue
+        tex, smp, uv, off, comp = m.group(1), m.group(2), args[0], args[1], args[2]
+        out.append(msl[i:m.start()])
+        out.append('dm_gather_rt(spvDescriptorSet0.%s, spvDescriptorSet0.%s, %s, %s, %s)' % (tex, smp, uv, off, comp))
+        i = tail + (2 if suffix else 0)
+        n += 1
+    if not n:
+        return msl
+    msl = ''.join(out)
+    k = msl.index('\n', msl.index('using namespace metal;')) + 1
+    return msl[:k] + GATHER_RT_H + msl[k:]
+
 def gather_offsets(msl):
     if not re.search(r'\bspvGather(Compare)?ConstOffsets\(spvDesc|= spvGather(Compare)?ConstOffsets\(', msl): return msl
     arrays = {}
@@ -1501,6 +1562,7 @@ def finish(key, w, j, c1):
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
+    src = gather_rt_reads(src)   # per-lane-offset gathers through explicit texel reads (see gather_rt_reads)
     try: src = hmma_msl(src, j.get('pc_paired', ''))   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
