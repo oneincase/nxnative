@@ -295,11 +295,11 @@ def gather_rt_reads(msl):
             else:
                 cur += ch
         args.append(cur.strip())
-        tail = j + 1
+        tail = j
         suffix = re.match(r'\.(w)', msl[tail:tail + 2])
-        if len(args) != 3 or GATHER_RT_OFF.fullmatch(args[1]):
+        if len(args) != 3 or not suffix or GATHER_RT_OFF.fullmatch(args[1]) or re.fullmatch(r'int2\(\s*-?\d+\s*\)', args[1]):
             out.append(msl[i:m.end()])
-            i = m.end()   # a constant offset (or another form): keep the gather
+            i = m.end()   # a constant offset (or a vec4-valued site): keep the gather
             continue
         tex, smp, uv, off, comp = m.group(1), m.group(2), args[0], args[1], args[2]
         out.append(msl[i:m.start()])
