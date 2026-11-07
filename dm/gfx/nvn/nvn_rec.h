@@ -149,7 +149,7 @@ static void rec_exec(const rec_t *r) {
     case RO_R_DRAW_IDX: [(id<MTL4RenderCommandEncoder>)e drawIndexedPrimitives:a[0] indexCount:a[1] indexType:a[2] indexBuffer:a[3] indexBufferLength:a[4] instanceCount:a[5] baseVertex:(NSInteger)a[6] baseInstance:a[7]]; break;
     case RO_R_DRAW_IDX_IND: [(id<MTL4RenderCommandEncoder>)e drawIndexedPrimitives:a[0] indexType:a[1] indexBuffer:a[2] indexBufferLength:a[3] indirectBuffer:a[4]]; break;
     case RO_R_MESH: [(id<MTL4RenderCommandEncoder>)e drawMeshThreadgroups:MTLSizeMake(a[0], 1, 1) threadsPerObjectThreadgroup:MTLSizeMake(a[2] ? a[2] : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(a[1], 1, 1)]; break;
-    case RO_R_MESH_IND: [(id<MTL4RenderCommandEncoder>)e drawMeshThreadgroupsWithIndirectBuffer:a[0] threadsPerObjectThreadgroup:MTLSizeMake(a[2] ? a[2] : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(a[1], 1, 1)]; break;
+    case RO_R_MESH_IND: [(id<MTL4RenderCommandEncoder>)e drawMeshThreadgroupsWithIndirectBuffer:a[0] threadsPerObjectThreadgroup:MTLSizeMake(a[2] ? a[2] : 1, 1, 1) threadsPerMeshThreadgroup:MTLSizeMake(a[1], 1, 1)]; break;   // PR #1312's indirect task / mesh draws: the encode thread (iOS) aborted on the selector
     case RO_R_STORE_C: [(id<MTL4RenderCommandEncoder>)e setColorStoreAction:a[0] atIndex:a[1]]; break;
     case RO_R_STORE_D: [(id<MTL4RenderCommandEncoder>)e setDepthStoreAction:a[0]]; break;
     case RO_R_STORE_S: [(id<MTL4RenderCommandEncoder>)e setStencilStoreAction:a[0]]; break;
@@ -183,13 +183,11 @@ static void rec_exec(const rec_t *r) {
 static void *rec_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-encode");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    { void dm_frame_wg_join(void); dm_frame_wg_join(); }   // hle_nvn.c: the encode thread works to the frame's deadline
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
         while (!g_rb_head) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
         rec_blk *b = g_rb_head; g_rb_head = b->next; if (!g_rb_head) g_rb_tail = NULL; g_rb_busy = 1;
         pthread_mutex_unlock(&g_rb_mu);
-        { void dm_frame_wg_join(void); dm_frame_wg_join(); }   // Deadline boost turned on in the game's settings later: the encode thread joins then too (once; a cheap check after)
         @autoreleasepool { for (int i = 0; i < b->n; i++) rec_exec(&b->r[i]); }
         pthread_mutex_lock(&g_rb_mu);
         b->n = 0; b->next = g_rb_free; g_rb_free = b; g_rb_busy = 0;
@@ -290,8 +288,7 @@ static inline id rec_table_real(id t) { return [t isKindOfClass:[DmRecTable clas
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexType:(MTLIndexType)t indexBuffer:(uint64_t)g indexBufferLength:(NSUInteger)len indirectBuffer:(uint64_t)ind {
     rec_t *r = rec_put(RO_R_DRAW_IDX_IND, 0); r->a[0] = p; r->a[1] = t; r->a[2] = g; r->a[3] = len; r->a[4] = ind; }
 - (void)drawMeshThreadgroups:(MTLSize)g threadsPerObjectThreadgroup:(MTLSize)o threadsPerMeshThreadgroup:(MTLSize)m { rec_t *r = rec_put(RO_R_MESH, 0); r->a[0] = g.width; r->a[1] = m.width; r->a[2] = o.width; }
-// Task / mesh draws whose group count the GPU writes (mesh_tasks_draw's indirect form, nvn_geometry.inc mtk_encode): without it the encode thread stopped at Ocarina of Time's first one (iPhone, frame 9911)
-- (void)drawMeshThreadgroupsWithIndirectBuffer:(uint64_t)g threadsPerObjectThreadgroup:(MTLSize)o threadsPerMeshThreadgroup:(MTLSize)m { rec_t *r = rec_put(RO_R_MESH_IND, 0); r->a[0] = g; r->a[1] = m.width; r->a[2] = o.width; }
+- (void)drawMeshThreadgroupsWithIndirectBuffer:(MTLGPUAddress)ib threadsPerObjectThreadgroup:(MTLSize)o threadsPerMeshThreadgroup:(MTLSize)m { rec_t *r = rec_put(RO_R_MESH_IND, 0); r->a[0] = ib; r->a[1] = m.width; r->a[2] = o.width; }
 - (void)setColorStoreAction:(MTLStoreAction)a atIndex:(NSUInteger)i { rec_t *r = rec_put(RO_R_STORE_C, 0); r->a[0] = a; r->a[1] = i; }
 - (void)setDepthStoreAction:(MTLStoreAction)a { rec_put(RO_R_STORE_D, 0)->a[0] = a; }
 - (void)setStencilStoreAction:(MTLStoreAction)a { rec_put(RO_R_STORE_S, 0)->a[0] = a; }
