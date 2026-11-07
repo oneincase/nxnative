@@ -193,6 +193,8 @@ The games below have completed a gameplay check. Each profile links to its `READ
 | Game | Title ID | Build | SDK | Engine | Graphics |
 |---|---|---|---|---|---|
 | [The Legend of Zelda: Ocarina of Time](0400486024DEC000/README.md) | `0400486024DEC000` | v0 (Switch 2) | 22.2.8 (Ounce) | sead / agl / gsys, Havok | NVN2 |
+| [ŌKAMI HD](0100276009872000/README.md) | `0100276009872000` | 1.0.0 (base) | 4.5.0 | Clover Studio's PS2 engine, remastered; CRIWARE | NVN |
+| [Kirby Air Riders](040077201BE50000/README.md) | `040077201BE50000` | v458752 (Switch 2) | 20.5.26 (Ounce) | Its own engine (`phx`, `Aurora`) | NVN2 |
 
 ## Keys
 
